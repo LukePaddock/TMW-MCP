@@ -1,0 +1,5 @@
+# Direct dependencies. Regenerate pins with:
+#   .venv\Scripts\python.exe -m pip install --upgrade mcp[cli] pyodbc python-dotenv
+mcp[cli]==2.2.0
+pyodbc==5.3.0
+python-dotenv==1.2.3

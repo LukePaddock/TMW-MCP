@@ -1,0 +1,21 @@
+# Environment / secrets
+.env
+.env.local
+
+# Virtual environments
+.venv/
+venv/
+tms-mcp/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
