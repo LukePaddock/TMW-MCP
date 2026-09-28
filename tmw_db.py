@@ -1,4 +1,119 @@
+import threading
+from datetime import datetime
+
 import pyodbc
+
+# --- Order search ---------------------------------------------------------
+#
+# One query serves every combination of filters. Each entry maps a filter name
+# to a hardcoded SQL fragment; user values are always parameterized, never
+# interpolated. Adding a searchable field is one line here, not a new method.
+#
+# "list" fragments take {ph} and expand to IN (?, ?, ...).
+
+_ORDER_FILTERS: dict[str, tuple[str, str]] = {
+    "orders":           ("oh.ord_hdrnumber IN ({ph})", "list"),
+    "order_numbers":    ("oh.ord_number IN ({ph})", "list"),
+    "billto":           ("oh.ord_billto IN ({ph})", "list"),
+    "shipper":          ("oh.ord_shipper IN ({ph})", "list"),
+    "consignee":        ("oh.ord_consignee IN ({ph})", "list"),
+    "status":           ("oh.ord_status IN ({ph})", "list"),
+    "invoice_status":   ("oh.ord_invoicestatus IN ({ph})", "list"),
+    "revtype1":         ("oh.ord_revtype1 IN ({ph})", "list"),
+    "revtype2":         ("oh.ord_revtype2 IN ({ph})", "list"),
+    "revtype3":         ("oh.ord_revtype3 IN ({ph})", "list"),
+    "revtype4":         ("oh.ord_revtype4 IN ({ph})", "list"),
+    "origin_company":   ("oh.ord_originpoint IN ({ph})", "list"),
+    "dest_company":     ("oh.ord_destpoint IN ({ph})", "list"),
+    "origin_city":      ("oh.ord_origincity IN ({ph})", "list"),
+    "dest_city":        ("oh.ord_destcity IN ({ph})", "list"),
+    "origin_state":     ("oh.ord_originstate IN ({ph})", "list"),
+    "dest_state":       ("oh.ord_deststate IN ({ph})", "list"),
+    "started_after":    ("oh.ord_startdate >= ?", "date"),
+    "started_before":   ("oh.ord_startdate < ?", "date"),
+    "completed_after":  ("oh.ord_completiondate >= ?", "date"),
+    "completed_before": ("oh.ord_completiondate < ?", "date"),
+    "min_charge":       ("oh.ord_totalcharge >= ?", "scalar"),
+}
+
+# group_by name -> (key expression, optional label expression)
+_ORDER_GROUPS: dict[str, tuple[str, str | None]] = {
+    "revtype1":       ("oh.ord_revtype1", None),
+    "revtype2":       ("oh.ord_revtype2", None),
+    "revtype3":       ("oh.ord_revtype3", None),
+    "revtype4":       ("oh.ord_revtype4", None),
+    "status":         ("oh.ord_status", None),
+    "invoice_status": ("oh.ord_invoicestatus", None),
+    "billto":         ("oh.ord_billto", "b.cmp_name"),
+    "shipper":        ("oh.ord_shipper", "sh.cmp_name"),
+    "consignee":      ("oh.ord_consignee", "cn.cmp_name"),
+    "origin_city":    ("ocity.cty_nmstct", None),
+    "dest_city":      ("dcity.cty_nmstct", None),
+    "origin_state":   ("oh.ord_originstate", None),
+    "dest_state":     ("oh.ord_deststate", None),
+    "month":          ("CONVERT(char(7), oh.ord_startdate, 126)", None),
+    "year":           ("CONVERT(char(4), oh.ord_startdate, 126)", None),
+}
+
+_ORDER_FROM = """
+    FROM orderheader oh
+    LEFT JOIN city ocity  ON ocity.cty_code = oh.ord_origincity
+    LEFT JOIN city dcity  ON dcity.cty_code = oh.ord_destcity
+    LEFT JOIN company b   ON b.cmp_id = oh.ord_billto
+    LEFT JOIN company sh  ON sh.cmp_id = oh.ord_shipper
+    LEFT JOIN company cn  ON cn.cmp_id = oh.ord_consignee
+"""
+
+
+def _coerce_date(value):
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        raise ValueError(
+            f"Expected an ISO date such as '2025-01-31', got {value!r}"
+        ) from None
+
+
+def _build_where(filters: dict) -> tuple[str, list]:
+    """Turn a dict of filters into a WHERE clause and its parameters.
+
+    Unknown filter names raise rather than being silently ignored, so a
+    mistyped filter can never widen the result set.
+    """
+    clauses: list[str] = []
+    params: list = []
+
+    for name, value in filters.items():
+        if value is None:
+            continue
+        spec = _ORDER_FILTERS.get(name)
+        if spec is None:
+            valid = ", ".join(sorted(_ORDER_FILTERS))
+            raise ValueError(f"Unknown filter {name!r}. Valid filters: {valid}")
+        fragment, kind = spec
+
+        if kind == "list":
+            values = [value] if isinstance(value, (str, int)) else list(value)
+            if not values:
+                continue
+            clauses.append(fragment.format(ph=", ".join("?" * len(values))))
+            params.extend(values)
+        elif kind == "date":
+            clauses.append(fragment)
+            params.append(_coerce_date(value))
+        else:
+            clauses.append(fragment)
+            params.append(value)
+
+    if not clauses:
+        raise ValueError(
+            "At least one filter is required — an unfiltered search would scan "
+            "every order in the system."
+        )
+    return " AND ".join(clauses), params
+
 
 
 class TmwDB:
@@ -10,7 +125,10 @@ class TmwDB:
         user: str | None = None,
         password: str | None = None,
         timeout: int = 30,
+        encrypt: str | None = None,
+        trust_server_certificate: str | None = None,
         checkcall_lookback_days: int = 30,
+        max_search_rows: int = 200,
     ):
         self.server = server
         self.database = database
@@ -18,8 +136,11 @@ class TmwDB:
         self.user = user
         self.password = password
         self.timeout = timeout
+        self.encrypt = encrypt
+        self.trust_server_certificate = trust_server_certificate
         self.checkcall_lookback_days = checkcall_lookback_days
-        self.conn = None
+        self.max_search_rows = max_search_rows
+        self._local = threading.local()
 
     @classmethod
     def from_settings(cls, settings) -> "TmwDB":
@@ -31,8 +152,26 @@ class TmwDB:
             user=settings.db_user,
             password=settings.db_password,
             timeout=settings.db_timeout,
+            encrypt=settings.db_encrypt,
+            trust_server_certificate=settings.db_trust_server_certificate,
             checkcall_lookback_days=settings.checkcall_lookback_days,
+            max_search_rows=settings.max_search_rows,
         )
+
+    @property
+    def conn(self):
+        """This thread's connection, or None if it has not opened one yet.
+
+        pyodbc.threadsafety is 1 — connections cannot be shared between threads
+        — and the streamable-http transport dispatches sync tool functions to a
+        thread pool, so each worker thread gets its own. ODBC connection pooling
+        (pyodbc.pooling, on by default) makes the extra connects cheap.
+        """
+        return getattr(self._local, "conn", None)
+
+    @conn.setter
+    def conn(self, value):
+        self._local.conn = value
 
     def connect(self):
         conn_str = (
@@ -45,9 +184,19 @@ class TmwDB:
         else:
             conn_str += "Trusted_Connection=yes;"
 
+        # ODBC Driver 18 (what the Linux container uses) defaults to
+        # Encrypt=yes and verifies the certificate, so a SQL Server with a
+        # self-signed or AD-issued cert is refused unless one of these is set.
+        # The Windows Native Client 11 path leaves both unset and is unchanged.
+        if self.encrypt:
+            conn_str += f"Encrypt={self.encrypt};"
+        if self.trust_server_certificate:
+            conn_str += f"TrustServerCertificate={self.trust_server_certificate};"
+
         self.conn = pyodbc.connect(conn_str, timeout=self.timeout)
 
     def close(self):
+        """Close this thread's connection. Other threads keep theirs."""
         if self.conn:
             self.conn.close()
             self.conn = None
@@ -79,6 +228,9 @@ class TmwDB:
         return [cls(*row) for row in cursor.fetchall()]
 
     def get_truck_location(self, truck_ids: list[str]) -> list[dict]:
+        if not truck_ids:
+            return []
+
         if not self.conn:
             self.connect()
 
@@ -158,6 +310,9 @@ class TmwDB:
         ]
 
     def get_order_stops(self, order_ids: list[str]) -> list[dict]:
+        if not order_ids:
+            return []
+
         if not self.conn:
             self.connect()
 
@@ -205,6 +360,9 @@ class TmwDB:
         return [self._stop_row_to_dict(row) for row in cursor.fetchall()]
 
     def get_leg_stops(self, leg_ids: list[str]) -> list[dict]:
+        if not leg_ids:
+            return []
+
         if not self.conn:
             self.connect()
 
@@ -249,6 +407,9 @@ class TmwDB:
         return [self._stop_row_to_dict(row) for row in cursor.fetchall()]
 
     def get_movement_stops(self, mov_ids: list[str]) -> list[dict]:
+        if not mov_ids:
+            return []
+
         if not self.conn:
             self.connect()
 
@@ -323,6 +484,9 @@ class TmwDB:
         ]
 
     def get_truck_plan(self, truck_ids: list[str]) -> list[dict]:
+        if not truck_ids:
+            return []
+
         if not self.conn:
             self.connect()
 
@@ -390,3 +554,147 @@ class TmwDB:
             }
             for row in cursor.fetchall()
         ]
+
+    def resolve_cities(self, name: str, state: str | None = None, limit: int = 25) -> list[dict]:
+        if not self.conn:
+            self.connect()
+
+        sql = """
+            SELECT TOP (?) cty_code, cty_name, cty_state, cty_nmstct
+            FROM city
+            WHERE cty_name LIKE ?
+        """
+        params: list = [limit, f"{name}%"]
+        if state:
+            sql += " AND cty_state = ?"
+            params.append(state)
+        sql += " ORDER BY LEN(cty_name), cty_name"
+
+        cursor = self.conn.cursor()
+        cursor.execute(sql, params)
+
+        return [
+            {"cty_code": row[0], "city": row[1], "state": row[2], "name_state": row[3]}
+            for row in cursor.fetchall()
+        ]
+
+    def search_orders(self, limit: int | None = None, **filters) -> dict:
+        if not self.conn:
+            self.connect()
+
+        limit = min(limit or self.max_search_rows, self.max_search_rows)
+        where, params = _build_where(filters)
+
+        cursor = self.conn.cursor()
+        cursor.execute(f"""
+            SELECT TOP (?)
+                oh.ord_hdrnumber,
+                oh.ord_number,
+                oh.ord_status,
+                oh.ord_invoicestatus,
+                oh.ord_billto,
+                b.cmp_name AS billto_name,
+                oh.ord_shipper,
+                sh.cmp_name AS shipper_name,
+                oh.ord_consignee,
+                cn.cmp_name AS consignee_name,
+                oh.ord_revtype1,
+                oh.ord_revtype2,
+                oh.ord_startdate,
+                oh.ord_completiondate,
+                ocity.cty_nmstct AS origin,
+                dcity.cty_nmstct AS destination,
+                oh.ord_totalmiles,
+                oh.ord_totalweight,
+                oh.ord_totalcharge,
+                oh.mov_number
+            {_ORDER_FROM}
+            WHERE {where}
+            ORDER BY oh.ord_startdate DESC
+        """, [limit + 1, *params])
+
+        rows = cursor.fetchall()
+        truncated = len(rows) > limit
+
+        return {
+            "orders": [
+                {
+                    "ord_hdrnumber": row[0],
+                    "ord_number": row[1].strip() if row[1] else None,
+                    "status": row[2],
+                    "invoice_status": row[3],
+                    "billto": row[4],
+                    "billto_name": row[5],
+                    "shipper": row[6],
+                    "shipper_name": row[7],
+                    "consignee": row[8],
+                    "consignee_name": row[9],
+                    "revtype1": row[10],
+                    "revtype2": row[11],
+                    "start_date": str(row[12]) if row[12] else None,
+                    "completion_date": str(row[13]) if row[13] else None,
+                    "origin": row[14],
+                    "destination": row[15],
+                    "miles": row[16],
+                    "weight": row[17],
+                    "total_charge": row[18],
+                    "mov_number": row[19],
+                }
+                for row in rows[:limit]
+            ],
+            "count": min(len(rows), limit),
+            "truncated": truncated,
+        }
+
+    def summarize_orders(self, group_by: str, limit: int | None = None, **filters) -> dict:
+        if not self.conn:
+            self.connect()
+
+        spec = _ORDER_GROUPS.get(group_by)
+        if spec is None:
+            valid = ", ".join(sorted(_ORDER_GROUPS))
+            raise ValueError(f"Unknown group_by {group_by!r}. Valid values: {valid}")
+        key_expr, label_expr = spec
+
+        limit = min(limit or self.max_search_rows, self.max_search_rows)
+        where, params = _build_where(filters)
+
+        label_select = f"{label_expr} AS label," if label_expr else "NULL AS label,"
+        group_cols = f"{key_expr}, {label_expr}" if label_expr else key_expr
+
+        cursor = self.conn.cursor()
+        cursor.execute(f"""
+            SELECT TOP (?)
+                {key_expr} AS grp,
+                {label_select}
+                COUNT(*) AS order_count,
+                SUM(oh.ord_totalcharge) AS total_charge,
+                SUM(oh.ord_totalmiles) AS total_miles,
+                SUM(oh.ord_totalweight) AS total_weight,
+                SUM(oh.ord_totalcharge) / NULLIF(SUM(oh.ord_totalmiles), 0) AS rev_per_mile
+            {_ORDER_FROM}
+            WHERE {where}
+            GROUP BY {group_cols}
+            ORDER BY SUM(oh.ord_totalcharge) DESC
+        """, [limit + 1, *params])
+
+        rows = cursor.fetchall()
+        truncated = len(rows) > limit
+
+        return {
+            "group_by": group_by,
+            "groups": [
+                {
+                    "group": row[0],
+                    "label": row[1],
+                    "order_count": row[2],
+                    "total_charge": row[3],
+                    "total_miles": row[4],
+                    "total_weight": row[5],
+                    "rev_per_mile": round(row[6], 3) or 0.0 if row[6] is not None else None,
+                }
+                for row in rows[:limit]
+            ],
+            "count": min(len(rows), limit),
+            "truncated": truncated,
+        }

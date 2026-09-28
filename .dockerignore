@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.gitattributes
+# Never bake credentials into an image layer - compose injects .env at runtime.
+.env
+*.log
+smoke_test.py
+CLAUDE.md
+README.md
+requirements-lock.txt

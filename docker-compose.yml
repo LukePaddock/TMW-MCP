@@ -1,0 +1,65 @@
+services:
+  tmw-mcp:
+    build: .
+    image: tmw-mcp:latest
+    container_name: tmw-mcp
+    restart: unless-stopped
+
+    # Secrets and DB settings come from .env, which is never baked into the
+    # image. Values under `environment:` below override it.
+    env_file: .env
+
+    environment:
+      # --- Container-specific overrides (these WIN over .env) ---
+
+      # The Windows "SQL Server Native Client 11.0" driver does not exist on
+      # Linux. This must be the driver installed in the image.
+      TMW_DB_DRIVER: ODBC Driver 18 for SQL Server
+
+      # Driver 18 defaults to Encrypt=yes with full certificate validation.
+      # Against a SQL Server using a self-signed or AD-issued cert that fails,
+      # so trust it explicitly. Prefer installing the CA into the image and
+      # removing this if your SQL Server has a properly signed certificate.
+      TMW_DB_TRUST_SERVER_CERTIFICATE: "yes"
+
+      # Bind all interfaces INSIDE the container. What is actually reachable
+      # is decided by `ports:` below, not by this.
+      TMW_MCP_HOST: 0.0.0.0
+      TMW_MCP_PORT: "8000"
+
+      # Must match the hostname clients dial. Behind a proxy that is the public
+      # name, not this container. Leaving it unset disables DNS rebinding
+      # protection - the server logs a warning at startup if so.
+      TMW_MCP_ALLOWED_HOSTS: ${TMW_MCP_ALLOWED_HOSTS:-}
+      TMW_MCP_ALLOWED_ORIGINS: ${TMW_MCP_ALLOWED_ORIGINS:-}
+
+    # Published to loopback only. Nginx Proxy Manager running on THIS host
+    # reaches it at 127.0.0.1:8000; nothing else on the network can.
+    ports:
+      - "127.0.0.1:8000:8000"
+
+    # If NPM runs in Docker, prefer this instead of `ports:` above: delete the
+    # ports block, uncomment below, and point the proxy host at
+    # http://tmw-mcp:8000. Nothing is then exposed on the host at all.
+    #
+    # networks:
+    #   - npm
+
+    # `sqlhost` is a short hostname that container DNS will not resolve. Use an
+    # FQDN or IP in TMW_DB_SERVER, or map it here.
+    # extra_hosts:
+    #   - "sqlhost:192.0.2.10"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    security_opt:
+      - no-new-privileges:true
+
+# networks:
+#   npm:
+#     external: true
+#     name: <your NPM network, e.g. nginxproxymanager_default>
