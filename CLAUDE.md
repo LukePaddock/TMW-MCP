@@ -13,7 +13,7 @@ tmw_mcp/
 ├── requirements-lock.txt   # Full pinned freeze of the working environment
 ├── requirements-docker.txt # Lock minus pywin32, for the Linux image
 ├── Dockerfile              # Multi-stage build with msodbcsql18
-├── docker-compose.yml      # Container config; overrides driver + bind host
+├── compose.yml.example     # Container config template; copy to compose.yml
 ├── healthcheck.py          # Container probe — 401 means healthy
 ├── smoke_test.py           # End-to-end check against a running server
 ├── .env.example            # Template for local configuration
@@ -63,12 +63,13 @@ Terminate TLS at the proxy; the app speaks plain HTTP.
 ## Docker
 
 ```
+cp compose.yml.example compose.yml   # then edit for your environment
 docker compose up -d --build
 docker compose logs -f
 python smoke_test.py http://127.0.0.1:8000/mcp <api-key>
 ```
 
-`docker-compose.yml` reads `.env` for secrets and overrides three things the
+`compose.yml` reads `.env` for secrets and overrides three things the
 container needs differently from Windows:
 
 | Setting | Windows | Container | Why |
