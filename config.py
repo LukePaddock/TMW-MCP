@@ -37,6 +37,27 @@ def _csv(name: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _hosts(name: str) -> list[str]:
+    """Read a host allow-list, accepting either spelling of each entry.
+
+    The transport matches a bare entry exactly, and treats a `host:*` entry as
+    "that host with any port" — `host:*` does NOT match a host with no port at
+    all. Behind a reverse proxy on 443 the forwarded Host header has no port,
+    so writing only `host:*` rejects every request with a 421. Accept both
+    forms for every entry so either spelling works.
+    """
+    expanded: list[str] = []
+    for entry in _csv(name):
+        expanded.append(entry)
+        if entry.endswith(":*"):
+            bare = entry[:-2]
+            if bare:
+                expanded.append(bare)
+        elif ":" not in entry:
+            expanded.append(f"{entry}:*")
+    return list(dict.fromkeys(expanded))
+
+
 def _api_keys(name: str) -> dict[str, str]:
     """Parse comma-separated LABEL:SECRET pairs into {label: secret}.
 
@@ -98,6 +119,14 @@ def load_settings() -> Settings:
         )
 
     mcp_host = _optional("TMW_MCP_HOST") or "127.0.0.1"
+    allowed_hosts = _hosts("TMW_MCP_ALLOWED_HOSTS")
+    if _csv("TMW_MCP_ALLOWED_ORIGINS") and not allowed_hosts:
+        raise ConfigError(
+            "TMW_MCP_ALLOWED_ORIGINS is set but TMW_MCP_ALLOWED_HOSTS is empty. "
+            "That enables DNS rebinding protection with an empty host allow-list, "
+            "which rejects every request with 421. Set TMW_MCP_ALLOWED_HOSTS to "
+            "the hostname clients dial."
+        )
     api_keys = _api_keys("TMW_MCP_API_KEYS")
     if mcp_host not in LOOPBACK_HOSTS and not api_keys:
         raise ConfigError(
@@ -119,7 +148,7 @@ def load_settings() -> Settings:
         max_search_rows=_int("TMW_MAX_SEARCH_ROWS", 200),
         mcp_host=mcp_host,
         mcp_port=_int("TMW_MCP_PORT", 8000),
-        mcp_allowed_hosts=_csv("TMW_MCP_ALLOWED_HOSTS"),
+        mcp_allowed_hosts=_hosts("TMW_MCP_ALLOWED_HOSTS"),
         mcp_allowed_origins=_csv("TMW_MCP_ALLOWED_ORIGINS"),
         api_keys=api_keys,
     )

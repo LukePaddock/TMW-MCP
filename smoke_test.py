@@ -24,6 +24,36 @@ def check(ok: bool, label: str, detail: str = "") -> None:
     print(f"  {'PASS' if ok else 'FAIL'}  {label}{f'  - {detail}' if detail else ''}")
 
 
+def _describe(exc: BaseException, depth: int = 0) -> str:
+    """Flatten an exception into something a human can act on.
+
+    anyio wraps transport failures in an ExceptionGroup, which prints as
+    "unhandled errors in a TaskGroup" and hides the cause - an HTTP 421 from a
+    Host allow-list mismatch, say. Unwrap to the innermost real error and
+    surface any HTTP status with it.
+    """
+    if isinstance(exc, BaseExceptionGroup) and exc.exceptions and depth < 5:
+        return " | ".join(_describe(e, depth + 1) for e in exc.exceptions)
+
+    detail = f"{type(exc).__name__}: {exc}"
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = getattr(response, "status_code", None)
+        body = ""
+        try:
+            body = response.text[:120].strip()
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+        if status:
+            detail = f"HTTP {status}" + (f" - {body}" if body else "") + f" ({type(exc).__name__})"
+    cause = exc.__cause__ or exc.__context__
+    if cause is not None and depth < 5:
+        inner = _describe(cause, depth + 1)
+        if inner not in detail:
+            detail = f"{detail}  <- {inner}"
+    return detail
+
+
 async def expect_401(url: str, token: str | None) -> None:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     headers |= {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
@@ -35,7 +65,12 @@ async def expect_401(url: str, token: str | None) -> None:
     async with httpx2.AsyncClient(timeout=30) as http:
         r = await http.post(url, json=body, headers=headers)
     label = "wrong key rejected" if token else "missing key rejected"
-    check(r.status_code == 401, label, f"got HTTP {r.status_code}")
+    hint = ""
+    if r.status_code == 421:
+        hint = " - TMW_MCP_ALLOWED_HOSTS does not match the Host header"
+    elif r.status_code == 406:
+        hint = " - Accept header must include text/event-stream"
+    check(r.status_code == 401, label, f"got HTTP {r.status_code}{hint}")
 
 
 async def session_checks(url: str, key: str) -> None:
@@ -101,7 +136,7 @@ async def main() -> int:
         await expect_401(url, "definitely-not-a-valid-key")
         await session_checks(url, key)
     except Exception as exc:  # noqa: BLE001 - report, don't traceback
-        check(False, "unexpected error", f"{type(exc).__name__}: {exc}")
+        check(False, "unexpected error", _describe(exc))
 
     passed = sum(1 for ok, _ in results if ok)
     print(f"\n{passed}/{len(results)} checks passed")

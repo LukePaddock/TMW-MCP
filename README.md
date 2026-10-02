@@ -188,8 +188,19 @@ Leaving `TMW_DB_USER` and `TMW_DB_PASSWORD` blank uses Windows Authentication
 (`Trusted_Connection=yes`). Setting only one of the two is an error.
 
 Behind a reverse proxy, set `TMW_MCP_ALLOWED_HOSTS` to the hostname clients
-dial - the public name, not the bind address. Binding a non-loopback address
-without it leaves DNS rebinding protection off.
+dial - the public name, not the bind address - and write it bare:
+
+```
+TMW_MCP_ALLOWED_HOSTS=mcp.example.com
+TMW_MCP_ALLOWED_ORIGINS=https://mcp.example.com
+```
+
+A `host:*` entry matches only a host *with* a port, and on 443 the forwarded
+`Host` header has none - so `host:*` alone returns `421 Invalid Host header` on
+every request. Both spellings are accepted and expanded, but bare is correct.
+
+Binding a non-loopback address without `TMW_MCP_ALLOWED_HOSTS` leaves DNS
+rebinding protection off entirely.
 
 ## Layout
 

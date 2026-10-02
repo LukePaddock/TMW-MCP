@@ -108,6 +108,15 @@ then exposed on the host at all.
 Set `TMW_MCP_ALLOWED_HOSTS` to the public hostname either way — behind a proxy
 that is the name clients dial, not the container.
 
+**Write the bare hostname**, e.g. `mcp.example.com`. The transport matches a bare
+entry exactly and treats `host:*` as "that host with any port" — `host:*` does
+**not** match a host with no port. On 443 the forwarded `Host` header carries no
+port, so a `host:*` entry alone returns `421 Invalid Host header` for every
+request. `_hosts()` in `config.py` expands either spelling to both, so both work,
+but bare is the form to write. Setting `TMW_MCP_ALLOWED_ORIGINS` while leaving
+`TMW_MCP_ALLOWED_HOSTS` empty is now a startup error, since that combination
+enables the check with an empty allow-list and rejects everything.
+
 ## Configuration
 
 All settings come from the environment via `config.py`, which loads `.env` at the project
