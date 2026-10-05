@@ -117,6 +117,74 @@ but bare is the form to write. Setting `TMW_MCP_ALLOWED_ORIGINS` while leaving
 `TMW_MCP_ALLOWED_HOSTS` empty is now a startup error, since that combination
 enables the check with an empty allow-list and rejects everything.
 
+## Logging failed authentication (fail2ban)
+
+Set `TMW_MCP_AUTH_LOG` and every rejected request appends one line:
+
+```
+2026-10-05 13:49:31 WARNING authentication failed from 203.0.113.45 reason=no_key path=/mcp
+```
+
+`reason` is `no_key` or `invalid_key`. The file rotates at 5 MB, keeping three
+old copies. Successful requests go to the general server log, never here, so
+this file contains only failures.
+
+### Getting the real client IP
+
+`TMW_MCP_TRUSTED_PROXIES` takes a comma-separated list of IPs or CIDR blocks.
+A forwarded header is believed **only** when the TCP peer falls inside one of
+them; otherwise the peer address is logged and the headers are ignored.
+
+This matters because `X-Forwarded-For` is attacker-controlled. Nginx appends
+rather than replaces, so a request arriving with `X-Forwarded-For: 8.8.8.8`
+reaches the app as `8.8.8.8, <real client>`. Reading the **first** entry — the
+usual mistake — lets anyone get an arbitrary address banned by fail2ban. The
+resolver therefore prefers `X-Real-IP`, which nginx overwrites, and falls back
+to the **last** `X-Forwarded-For` entry.
+
+Leave `TMW_MCP_TRUSTED_PROXIES` empty and headers are ignored entirely, which
+is correct for a direct bind and wrong behind a proxy — the log would then
+record the proxy's address, and fail2ban would ban the proxy. The server logs a
+warning at startup if the auth log is enabled without it.
+
+Uvicorn is started with `proxy_headers=False` deliberately. It ships its own
+forwarded-header handling that trusts `127.0.0.1` by default and rewrites
+`scope["client"]` before any middleware runs — a second, looser trust model that
+would silently override this one.
+
+### Wiring up fail2ban
+
+`fail2ban/` holds a filter and a jail:
+
+```bash
+sudo cp fail2ban/tmw-mcp.filter.conf /etc/fail2ban/filter.d/tmw-mcp.conf
+sudo cp fail2ban/tmw-mcp.jail.conf   /etc/fail2ban/jail.d/tmw-mcp.conf
+sudo fail2ban-regex /opt/tmw-mcp/logs/auth.log /etc/fail2ban/filter.d/tmw-mcp.conf
+sudo systemctl reload fail2ban && sudo fail2ban-client status tmw-mcp
+```
+
+Run `fail2ban-regex` before reloading — it reports how many lines matched, and
+is the authoritative check that the pattern works on your version.
+
+Two things that catch people out:
+
+- **The container runs as uid 10001.** Create the host log directory and give
+  it ownership, or the server cannot write to it:
+  `sudo mkdir -p /opt/tmw-mcp/logs && sudo chown 10001:10001 /opt/tmw-mcp/logs`
+- **Bans do nothing against dockerised NPM unless they target `DOCKER-USER`.**
+  Docker DNATs published ports in `nat PREROUTING`, so the traffic traverses
+  `FORWARD` and never reaches `INPUT`, where fail2ban's stock actions insert
+  their rules. The supplied jail sets `chain=DOCKER-USER`. If NPM runs directly
+  on the host instead, remove that override.
+
+### The zero-code alternative
+
+NPM writes its own access logs with real client IPs already, so a jail watching
+those for `401` responses needs no application changes. It is coarser — it
+cannot distinguish a bad key from any other 401, and it bans per proxy host
+rather than per endpoint — but if you want something running in five minutes,
+start there.
+
 ## Configuration
 
 All settings come from the environment via `config.py`, which loads `.env` at the project
@@ -139,6 +207,8 @@ root. `.env` is gitignored; `.env.example` documents every setting.
 | `TMW_MCP_ALLOWED_HOSTS` | no | — | Host allow-list; required in practice off loopback |
 | `TMW_MCP_ALLOWED_ORIGINS` | no | — | Origin allow-list |
 | `TMW_MCP_API_KEYS` | no | — | `LABEL:SECRET` pairs; required off loopback |
+| `TMW_MCP_TRUSTED_PROXIES` | no | — | IPs/CIDRs whose forwarded headers are believed |
+| `TMW_MCP_AUTH_LOG` | no | — | Path for the fail2ban-friendly auth failure log |
 
 Never hardcode connection details — add a setting to `config.py` and `.env.example` instead.
 

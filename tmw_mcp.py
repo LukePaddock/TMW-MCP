@@ -1,5 +1,7 @@
 import argparse
+import ipaddress
 import logging
+import logging.handlers
 import secrets
 
 from mcp.server.mcpserver import MCPServer
@@ -8,6 +10,60 @@ from config import LOOPBACK_HOSTS, load_settings
 from tmw_db import TmwDB
 
 logger = logging.getLogger("tmw_mcp")
+
+# Separate logger so the auth log holds only failures, in one stable format
+# that fail2ban can parse. It does not propagate into the general server log.
+auth_logger = logging.getLogger("tmw_mcp.auth")
+auth_logger.propagate = False
+
+
+def client_ip(scope, trusted_proxies) -> str:
+    """Best-effort real client IP, trusting forwarded headers only from a proxy.
+
+    `X-Forwarded-For` is client-supplied: nginx APPENDS to whatever arrived, so
+    a request carrying `X-Forwarded-For: 8.8.8.8` becomes `8.8.8.8, <real ip>`.
+    Reading the FIRST entry would let anyone get an arbitrary address banned,
+    so take the LAST, and only when the peer is a configured trusted proxy.
+    `X-Real-IP` is preferred because nginx overwrites rather than appends it.
+
+    With no trusted proxies configured, headers are ignored entirely and the
+    TCP peer is used - correct for a direct bind, and the safe default.
+    """
+    peer = scope.get("client")
+    peer_ip = peer[0] if peer else ""
+    if not peer_ip:
+        return "unknown"
+    if not trusted_proxies:
+        return peer_ip
+    try:
+        addr = ipaddress.ip_address(peer_ip)
+    except ValueError:
+        return peer_ip
+    if not any(addr in net for net in trusted_proxies):
+        # Not a proxy we trust, so its headers are not evidence of anything.
+        return peer_ip
+
+    headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
+    real_ip = headers.get("x-real-ip", "").strip()
+    if real_ip:
+        return real_ip
+    forwarded = headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[-1].strip()
+    return peer_ip
+
+
+def configure_auth_log(path: str) -> None:
+    """Send authentication failures to their own rotating file for fail2ban."""
+    handler = logging.handlers.RotatingFileHandler(
+        path, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s",
+                          datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    auth_logger.addHandler(handler)
+    auth_logger.setLevel(logging.WARNING)
 
 mcp = MCPServer("TMW MCP", instructions="""
 You are connected to a TMW Transportation Management System (TMS) database.
@@ -247,10 +303,11 @@ class BearerAuthMiddleware:
     others, and the access log attributes requests to a person.
     """
 
-    def __init__(self, app, api_keys: dict[str, str]):
+    def __init__(self, app, api_keys: dict[str, str], trusted_proxies=()):
         self.app = app
         # Reverse the mapping — lookup is by presented secret, not by label.
         self._by_secret = {secret: label for label, secret in api_keys.items()}
+        self.trusted_proxies = trusted_proxies
 
     def _label_for(self, token: str) -> str | None:
         # compare_digest against every key so a wrong key costs the same time
@@ -271,19 +328,25 @@ class BearerAuthMiddleware:
         label = self._label_for(token) if token else None
 
         if label is None:
-            client = scope.get("client")
-            logger.warning(
-                "rejected unauthenticated request to %s from %s",
-                scope.get("path"),
-                client[0] if client else "unknown",
+            ip = client_ip(scope, self.trusted_proxies)
+            reason = "no_key" if not token else "invalid_key"
+            # One stable line per failure, with the IP in a fixed position, so
+            # a fail2ban <HOST> capture stays valid as other fields change.
+            auth_logger.warning(
+                "authentication failed from %s reason=%s path=%s",
+                ip, reason, scope.get("path"),
             )
+            logger.warning("rejected request from %s (%s)", ip, reason)
             from starlette.responses import JSONResponse
 
             response = JSONResponse({"error": "unauthorized"}, status_code=401)
             await response(scope, receive, send)
             return
 
-        logger.info("authenticated %s -> %s", label, scope.get("path"))
+        logger.info(
+            "authenticated %s from %s -> %s",
+            label, client_ip(scope, self.trusted_proxies), scope.get("path"),
+        )
         scope.setdefault("state", {})["api_key_label"] = label
         await self.app(scope, receive, send)
 
@@ -291,6 +354,16 @@ class BearerAuthMiddleware:
 def run_http(settings) -> None:
     import uvicorn
     from mcp.server.transport_security import TransportSecuritySettings
+
+    if settings.auth_log:
+        configure_auth_log(settings.auth_log)
+        logger.info("auth failures logged to %s", settings.auth_log)
+        if not settings.trusted_proxies:
+            logger.warning(
+                "TMW_MCP_AUTH_LOG is set but TMW_MCP_TRUSTED_PROXIES is empty — "
+                "behind a reverse proxy the logged address will be the proxy, "
+                "not the client, and fail2ban would ban the proxy."
+            )
 
     if settings.mcp_host not in LOOPBACK_HOSTS and not settings.mcp_allowed_hosts:
         logger.warning(
@@ -312,7 +385,7 @@ def run_http(settings) -> None:
         transport_security=transport_security,
     )
     if settings.api_keys:
-        app = BearerAuthMiddleware(app, settings.api_keys)
+        app = BearerAuthMiddleware(app, settings.api_keys, settings.trusted_proxies)
         logger.info(
             "bearer auth enabled for %d key(s): %s",
             len(settings.api_keys),
@@ -321,7 +394,17 @@ def run_http(settings) -> None:
     else:
         logger.warning("no API keys configured — the server is unauthenticated")
 
-    uvicorn.run(app, host=settings.mcp_host, port=settings.mcp_port)
+    # proxy_headers=False is deliberate. Uvicorn ships its own forwarded-header
+    # handling, trusting 127.0.0.1 by default and rewriting scope["client"] from
+    # X-Forwarded-For before any middleware runs. That is a second, looser trust
+    # model layered under ours, and it wins because it runs first. Turning it off
+    # makes TMW_MCP_TRUSTED_PROXIES the single source of truth.
+    uvicorn.run(
+        app,
+        host=settings.mcp_host,
+        port=settings.mcp_port,
+        proxy_headers=False,
+    )
 
 
 def main() -> None:

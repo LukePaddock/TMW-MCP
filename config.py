@@ -4,6 +4,7 @@ Values come from a `.env` file at the project root when present, falling back to
 real environment variables. See `.env.example` for the full list of settings.
 """
 
+import ipaddress
 import os
 from dataclasses import dataclass
 
@@ -58,6 +59,19 @@ def _hosts(name: str) -> list[str]:
     return list(dict.fromkeys(expanded))
 
 
+def _networks(name: str):
+    """Parse a comma-separated list of IPs or CIDRs into networks."""
+    nets = []
+    for entry in _csv(name):
+        try:
+            nets.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            raise ConfigError(
+                f"{name} entry {entry!r} is not a valid IP address or CIDR block."
+            ) from None
+    return tuple(nets)
+
+
 def _api_keys(name: str) -> dict[str, str]:
     """Parse comma-separated LABEL:SECRET pairs into {label: secret}.
 
@@ -106,6 +120,8 @@ class Settings:
     mcp_allowed_hosts: list[str]
     mcp_allowed_origins: list[str]
     api_keys: dict[str, str]
+    trusted_proxies: tuple
+    auth_log: str | None
 
 
 def load_settings() -> Settings:
@@ -151,4 +167,6 @@ def load_settings() -> Settings:
         mcp_allowed_hosts=_hosts("TMW_MCP_ALLOWED_HOSTS"),
         mcp_allowed_origins=_csv("TMW_MCP_ALLOWED_ORIGINS"),
         api_keys=api_keys,
+        trusted_proxies=_networks("TMW_MCP_TRUSTED_PROXIES"),
+        auth_log=_optional("TMW_MCP_AUTH_LOG"),
     )

@@ -33,10 +33,27 @@ services:
       TMW_MCP_ALLOWED_HOSTS: ${TMW_MCP_ALLOWED_HOSTS:-}
       TMW_MCP_ALLOWED_ORIGINS: ${TMW_MCP_ALLOWED_ORIGINS:-}
 
+      # Networks whose X-Real-IP / X-Forwarded-For headers are believed. Set
+      # this to the proxy's address or the Docker bridge subnet, or the auth
+      # log records the proxy instead of the real client and fail2ban bans
+      # the proxy. Check the real value with:
+      #   docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' tmw-mcp
+      TMW_MCP_TRUSTED_PROXIES: ${TMW_MCP_TRUSTED_PROXIES:-172.16.0.0/12}
+
+      # Auth failures are written here for fail2ban. Inside the container.
+      TMW_MCP_AUTH_LOG: /var/log/tmw-mcp/auth.log
+
     # Published to loopback only. Nginx Proxy Manager running on THIS host
     # reaches it at 127.0.0.1:8000; nothing else on the network can.
     ports:
       - "127.0.0.1:8000:8000"
+
+    # Auth log, for fail2ban on the host to watch. The container runs as uid
+    # 10001, so create the directory and give it ownership first, or the
+    # server cannot write and startup fails:
+    #   sudo mkdir -p /opt/tmw-mcp/logs && sudo chown 10001:10001 /opt/tmw-mcp/logs
+    volumes:
+      - /opt/tmw-mcp/logs:/var/log/tmw-mcp
 
     # If NPM runs in Docker, prefer this instead of `ports:` above: delete the
     # ports block, uncomment below, and point the proxy host at
