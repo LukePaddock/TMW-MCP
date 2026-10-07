@@ -375,6 +375,33 @@ the largest `TON` values are around 61,460, which as short tons would be 123
 million lbs - so they, and rows with a missing or unknown unit, are treated as
 pounds. That covers 169 rows; `LBS` and `KGS` are 99.97% of rows with a weight.
 
+**Dimensions are normalised to inches, temperatures to Fahrenheit.**
+
+`min_length` / `min_width` / `min_height` compare against inches, with
+`dimension_basis` naming the caller's unit (`INS`, `FET`, `MTR`, `YRD`, `CM`), so
+`min_length=40, dimension_basis="FET"` means 40 feet and matches a 480 inch row.
+Length, width and height each have their own unit column and 168 rows disagree
+between them, so each is converted against its own unit, not the length unit.
+
+Unlike the weight labels, these are reliable: 97% of `FET` lengths are 60 or
+under (real feet), 90% of `INS` and 85% of `N` lengths fall in 61-700 (real
+inches), and `MTR` averages 6.34m x 2.76m x 2.80m. **`N` is inches** - it tracks
+`INS` exactly and is almost certainly a truncated "IN". Unlabelled rows average
+about 130 and are treated as inches.
+
+`min_temp` / `max_temp` compare against Fahrenheit, with `temp_basis` `"F"` or
+`"C"`. **The conversion is affine, not a scale factor**, so thresholds go through
+`_to_fahrenheit` rather than being multiplied - `min_temp=0, temp_basis="C"` means
+32 F. `F` is dominant (5,176 rows) and `C` is genuine (-20..28); unlabelled rows
+match the F range and are treated as F.
+
+`summarize_order_freight` normalises before aggregating, because a `MIN` across
+mixed C and F rows, or a `MAX` across `FET` and `INS`, is meaningless. It returns
+`temp_unit` `"F"` and `dimension_unit` `"INS"` to say so.
+
+Every result row carries `length_in`, `width_in`, `height_in`, `low_temp_f` and
+`high_temp_f` beside the stored values and their units.
+
 **Counts have no conversion** because `PCS`, `PLT`, `COIL` and `CAS` have no fixed
 ratio. `min_count` therefore spans unlike units unless paired with `count_unit`,
 and `summarize_order_freight` sets `mixed_count_units` when `pieces` added

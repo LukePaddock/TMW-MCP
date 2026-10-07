@@ -320,8 +320,10 @@ def summarize_order_freight(orders: list[str]) -> list[dict]:
     dimensions and the commodity codes, all taken from the authoritative DRP
     (delivery) stops.
 
-    Weight is normalised to POUNDS before summing, so an order mixing LBS and KGS
-    rows totals correctly; mixed_weight_units says whether that happened. Counts
+    Every measure is normalised before aggregating: weight in POUNDS, dimensions
+    in INCHES, temperatures in FAHRENHEIT. A MIN across mixed C and F rows, or a
+    MAX across FET and INS, would otherwise be meaningless. mixed_weight_units
+    says whether more than one weight unit contributed. Counts
     are NOT converted, and mixed_count_units true means `pieces` adds unlike units
     (PCS, PLT, COIL), so report it as unreliable rather than as a total.
 
@@ -340,8 +342,12 @@ def summarize_order_freight(orders: list[str]) -> list[dict]:
 def search_freight(
     stop_type: str = "DRP",
     weight_basis: str = "LBS",
+    dimension_basis: str = "INS",
+    temp_basis: str = "F",
     weight_unit: list[str] | None = None,
     count_unit: list[str] | None = None,
+    dimension_unit: list[str] | None = None,
+    temp_unit: list[str] | None = None,
     commodities: list[str] | None = None,
     commodity_class: list[str] | None = None,
     description: str | None = None,
@@ -400,6 +406,20 @@ def search_freight(
     Use weight_unit to restrict to rows stored in a given unit instead, e.g.
     weight_unit=["KGS"].
 
+    DIMENSIONS. min_length / min_width / min_height compare after normalising
+    every row to inches, and dimension_basis says which unit your threshold is in:
+    "INS", "FET", "MTR", "YRD" or "CM". min_length=40 with dimension_basis="FET"
+    means 40 feet and matches a 480 inch row. Length, width and height each carry
+    their own unit, and each is converted against its own. The unit labels here are
+    reliable - 97% of FET lengths are 60 or under, so they really are feet - and the
+    undocumented unit "N" behaves as inches. Results carry length_in, width_in and
+    height_in beside the stored values. Use dimension_unit to scope by stored unit.
+
+    TEMPERATURE. min_temp / max_temp compare after normalising to Fahrenheit, and
+    temp_basis is "F" or "C". min_temp=0 with temp_basis="C" means freezing, not
+    0 F, and matches rows at 32 F or above. Results carry low_temp_f and
+    high_temp_f. Use temp_unit to scope by stored unit.
+
     COUNTS ARE NOT CONVERTED. PCS, PLT, COIL and CAS have no fixed ratio, so a
     min_count threshold spans unlike units. Pair it with count_unit, e.g.
     count_unit=["PLT"], for a comparison that means something.
@@ -407,15 +427,20 @@ def search_freight(
     The stored weights contain bad data: 87 rows exceed 1,000,000 lbs and the
     largest is 505 billion. Treat extreme values as suspect rather than real.
 
-    Returns {"freight": [...], "count": n, "truncated": bool, "stop_type": str,
-    "weight_basis": str}. When truncated is true more rows matched than returned.
+    Returns {"freight": [...], "count": n, "truncated": bool, "stop_type": str}
+    plus the basis actually used for each measure. When truncated is true, more
+    rows matched than were returned.
     """
     return db.search_freight(
         stop_type=stop_type,
         weight_basis=weight_basis,
+        dimension_basis=dimension_basis,
+        temp_basis=temp_basis,
         limit=limit,
         weight_unit=weight_unit,
         count_unit=count_unit,
+        dimension_unit=dimension_unit,
+        temp_unit=temp_unit,
         commodities=commodities,
         commodity_class=commodity_class,
         description=description,

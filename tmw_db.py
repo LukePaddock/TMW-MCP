@@ -99,6 +99,62 @@ def _to_lbs(value, basis: str):
     return value
 
 
+# Dimensions are normalised to INCHES. Unlike the weight units, these labels are
+# mostly trustworthy: 97% of FET lengths are 60 or under (real feet), 90% of INS
+# and 85% of N lengths fall in the 61-700 range (real inches), and MTR averages
+# 6.34m x 2.76m x 2.80m, which is an ordinary load. 'N' is treated as inches - it
+# behaves exactly like INS and is almost certainly a truncated "IN".
+#
+# Length, width and height each carry their own unit column, and 168 rows
+# disagree between them, so every dimension is converted against its own unit
+# rather than against the length unit.
+_INCHES_PER = {"INS": 1.0, "N": 1.0, "FET": 12.0, "YRD": 36.0, "MTR": 39.3701, "CM": 0.393701}
+_DIMENSION_BASES = tuple(_INCHES_PER)
+
+
+def _dim_inches(value_col: str, unit_col: str) -> str:
+    """SQL expression normalising one dimension column to inches."""
+    whens = " ".join(
+        f"WHEN '{unit}' THEN {value_col} * {factor}"
+        for unit, factor in _INCHES_PER.items()
+        if factor != 1.0
+    )
+    # INS, N, UNK, blank and NULL fall through as inches: the unlabelled rows
+    # average about 130, which is inches-like, not feet-like.
+    return f"(CASE LTRIM(RTRIM(COALESCE({unit_col}, ''))) {whens} ELSE {value_col} END)"
+
+
+def _to_inches(value, basis: str):
+    """Convert a caller-supplied dimension threshold into inches."""
+    if value is None:
+        return None
+    return value * _INCHES_PER[basis]
+
+
+# Temperature is normalised to FAHRENHEIT. F is the dominant unit (5,176 rows)
+# and C is genuine (-20..28). Rows with no unit are treated as F, matching their
+# range. The conversion is affine, not a scale factor, so thresholds go through
+# _to_fahrenheit rather than being multiplied.
+_TEMP_BASES = ("F", "C")
+
+
+def _temp_f(value_col: str) -> str:
+    """SQL expression normalising a temperature column to Fahrenheit."""
+    return (
+        "(CASE WHEN LTRIM(RTRIM(COALESCE(f.fgt_tempunit, ''))) = 'C' "
+        f"THEN {value_col} * 9.0 / 5.0 + 32 ELSE {value_col} END)"
+    )
+
+
+def _to_fahrenheit(value, basis: str):
+    """Convert a caller-supplied temperature threshold into Fahrenheit."""
+    if value is None:
+        return None
+    if basis == "C":
+        return value * 9.0 / 5.0 + 32
+    return value
+
+
 _FREIGHT_FILTERS: dict[str, tuple[str, str]] = {
     "freight_numbers":  ("f.fgt_number IN ({ph})", "list"),
     "stops":            ("f.stp_number IN ({ph})", "list"),
@@ -114,11 +170,16 @@ _FREIGHT_FILTERS: dict[str, tuple[str, str]] = {
     # so filter by unit instead of hoping a threshold means one thing.
     "count_unit":       ("LTRIM(RTRIM(f.fgt_countunit)) IN ({ph})", "list"),
     "min_count":        ("f.fgt_count >= ?", "scalar"),
-    "min_length":       ("f.fgt_length >= ?", "scalar"),
-    "min_width":        ("f.fgt_width >= ?", "scalar"),
-    "min_height":       ("f.fgt_height >= ?", "scalar"),
-    "max_temp":         ("f.fgt_hitemp <= ?", "scalar"),
-    "min_temp":         ("f.fgt_lowtemp >= ?", "scalar"),
+    # Compared in inches; search_freight converts the threshold per
+    # dimension_basis first.
+    "min_length":       (f"{_dim_inches('f.fgt_length', 'f.fgt_lengthunit')} >= ?", "scalar"),
+    "min_width":        (f"{_dim_inches('f.fgt_width', 'f.fgt_widthunit')} >= ?", "scalar"),
+    "min_height":       (f"{_dim_inches('f.fgt_height', 'f.fgt_heightunit')} >= ?", "scalar"),
+    "dimension_unit":   ("LTRIM(RTRIM(f.fgt_lengthunit)) IN ({ph})", "list"),
+    # Compared in Fahrenheit; converted per temp_basis.
+    "max_temp":         (f"{_temp_f('f.fgt_hitemp')} <= ?", "scalar"),
+    "min_temp":         (f"{_temp_f('f.fgt_lowtemp')} >= ?", "scalar"),
+    "temp_unit":        ("LTRIM(RTRIM(f.fgt_tempunit)) IN ({ph})", "list"),
     # Flags take no parameter - the fragment is the whole predicate.
     "temp_controlled":  ("(f.fgt_lowtemp IS NOT NULL OR f.fgt_hitemp IS NOT NULL)", "flag"),
     "has_dimensions":   ("(f.fgt_length > 0 OR f.fgt_width > 0 OR f.fgt_height > 0)", "flag"),
@@ -819,9 +880,16 @@ class TmwDB:
             "height": row[23],
             "dimension_unit": (row[24] or "").strip() or None,
             "sequence": row[25],
+            # Normalised alongside the stored values, so rows with different
+            # units are comparable without the caller doing arithmetic.
+            "length_in": round(row[26], 2) if row[26] is not None else None,
+            "width_in": round(row[27], 2) if row[27] is not None else None,
+            "height_in": round(row[28], 2) if row[28] is not None else None,
+            "low_temp_f": round(row[29], 1) if row[29] is not None else None,
+            "high_temp_f": round(row[30], 1) if row[30] is not None else None,
         }
 
-    _FREIGHT_SELECT = """
+    _FREIGHT_SELECT = f"""
         f.fgt_number,
         s.ord_hdrnumber,
         f.stp_number,
@@ -847,13 +915,20 @@ class TmwDB:
         f.fgt_width,
         f.fgt_height,
         f.fgt_lengthunit,
-        f.fgt_sequence
+        f.fgt_sequence,
+        {_dim_inches('f.fgt_length', 'f.fgt_lengthunit')},
+        {_dim_inches('f.fgt_width', 'f.fgt_widthunit')},
+        {_dim_inches('f.fgt_height', 'f.fgt_heightunit')},
+        {_temp_f('f.fgt_lowtemp')},
+        {_temp_f('f.fgt_hitemp')}
     """
 
     def search_freight(
         self,
         stop_type: str | None = "DRP",
         weight_basis: str = "LBS",
+        dimension_basis: str = "INS",
+        temp_basis: str = "F",
         limit: int | None = None,
         **filters,
     ) -> dict:
@@ -863,10 +938,16 @@ class TmwDB:
         order filter too - so "oversize freight for this customer last quarter"
         is a single query. A `stop_type` of None or "ANY" searches every copy.
 
-        `min_weight` / `max_weight` are compared in pounds after normalising each
-        row. `weight_basis` says which unit the threshold itself is in, so
-        min_weight=10000 with weight_basis="KGS" means 10,000 kg and matches a
-        22,046 lb row.
+        Thresholds are compared against normalised values, and the three `*_basis`
+        arguments say which unit each threshold is expressed in:
+
+        - weight in pounds; weight_basis "LBS" or "KGS"
+        - dimensions in inches; dimension_basis "INS", "FET", "MTR", "YRD" or "CM"
+        - temperature in Fahrenheit; temp_basis "F" or "C"
+
+        So min_weight=10000 with weight_basis="KGS" means 10,000 kg and matches a
+        22,046 lb row, and min_length=40 with dimension_basis="FET" means 40 feet
+        and matches a 480 inch row.
         """
         if not self.conn:
             self.connect()
@@ -879,6 +960,25 @@ class TmwDB:
         for bound in ("min_weight", "max_weight"):
             if filters.get(bound) is not None:
                 filters[bound] = _to_lbs(filters[bound], basis)
+
+        dim_basis = (dimension_basis or "INS").upper()
+        if dim_basis not in _DIMENSION_BASES:
+            raise ValueError(
+                f"dimension_basis must be one of {', '.join(_DIMENSION_BASES)}, "
+                f"got {dimension_basis!r}"
+            )
+        for bound in ("min_length", "min_width", "min_height"):
+            if filters.get(bound) is not None:
+                filters[bound] = _to_inches(filters[bound], dim_basis)
+
+        t_basis = (temp_basis or "F").upper()
+        if t_basis not in _TEMP_BASES:
+            raise ValueError(
+                f"temp_basis must be one of {', '.join(_TEMP_BASES)}, got {temp_basis!r}"
+            )
+        for bound in ("min_temp", "max_temp"):
+            if filters.get(bound) is not None:
+                filters[bound] = _to_fahrenheit(filters[bound], t_basis)
 
         limit = min(limit or self.max_search_rows, self.max_search_rows)
         merged = {**_FREIGHT_FILTERS, **_ORDER_FILTERS}
@@ -921,6 +1021,10 @@ class TmwDB:
             "stop_type": (stop_type or "ANY").upper(),
             "weight_compared_in": "LBS",
             "weight_basis": basis,
+            "dimensions_compared_in": "INS",
+            "dimension_basis": dim_basis,
+            "temp_compared_in": "F",
+            "temp_basis": t_basis,
         }
 
     def get_order_freight(
@@ -978,11 +1082,13 @@ class TmwDB:
                     SUM(f.fgt_count)             AS pieces,
                     COUNT(DISTINCT NULLIF(LTRIM(RTRIM(f.fgt_weightunit)), '')) AS weight_units,
                     COUNT(DISTINCT NULLIF(LTRIM(RTRIM(f.fgt_countunit)), ''))  AS count_units,
-                    MIN(f.fgt_lowtemp)           AS low_temp,
-                    MAX(f.fgt_hitemp)            AS high_temp,
-                    MAX(f.fgt_length)            AS max_length,
-                    MAX(f.fgt_width)             AS max_width,
-                    MAX(f.fgt_height)            AS max_height
+                    -- Normalised before aggregating: a MIN across mixed C and
+                    -- F rows, or a MAX across FET and INS, is meaningless.
+                    MIN({_temp_f('f.fgt_lowtemp')})  AS low_temp,
+                    MAX({_temp_f('f.fgt_hitemp')})   AS high_temp,
+                    MAX({_dim_inches('f.fgt_length', 'f.fgt_lengthunit')}) AS max_length,
+                    MAX({_dim_inches('f.fgt_width', 'f.fgt_widthunit')})   AS max_width,
+                    MAX({_dim_inches('f.fgt_height', 'f.fgt_heightunit')}) AS max_height
                 FROM freightdetail f
                 JOIN stops s ON s.stp_number = f.stp_number
                 WHERE s.ord_hdrnumber IN ({placeholders})
@@ -1029,11 +1135,13 @@ class TmwDB:
                 "drp_stops": row[2],
                 "weight": drp_weight,
                 "pieces": drp_pieces,
-                "low_temp": row[5],
-                "high_temp": row[6],
-                "max_length": row[7],
-                "max_width": row[8],
-                "max_height": row[9],
+                "low_temp": round(row[5], 1) if row[5] is not None else None,
+                "high_temp": round(row[6], 1) if row[6] is not None else None,
+                "temp_unit": "F",
+                "max_length": round(row[7], 2) if row[7] is not None else None,
+                "max_width": round(row[8], 2) if row[8] is not None else None,
+                "max_height": round(row[9], 2) if row[9] is not None else None,
+                "dimension_unit": "INS",
                 "commodities": row[14],
                 # Weight is normalised to pounds before summing. Counts are not
                 # converted, so a true mixed_count_units means `pieces` adds

@@ -337,6 +337,14 @@ threshold is in - `min_weight=10000, weight_basis="KGS"` means 10,000 kg. Only
 `KGS` is converted; `TON` and `MTN` are mislabelled pounds in this data. Use
 `weight_unit` to scope to rows stored in one unit.
 
+Dimensions normalise to inches and temperatures to Fahrenheit the same way, via
+`dimension_basis` (`INS`, `FET`, `MTR`, `YRD`, `CM`) and `temp_basis` (`F`, `C`).
+`min_length=40, dimension_basis="FET"` means 40 feet, and `min_temp=0,
+temp_basis="C"` means freezing rather than 0 F. Dimension unit labels are reliable
+here, and the undocumented unit `N` behaves as inches. Results carry `length_in`,
+`width_in`, `height_in`, `low_temp_f` and `high_temp_f` beside the stored values.
+Scope by stored unit with `dimension_unit` or `temp_unit`.
+
 Counts are not converted, since `PCS`, `PLT` and `COIL` have no fixed ratio - pair
 `min_count` with `count_unit`. `summarize_order_freight` flags
 `mixed_weight_units` and `mixed_count_units` so a total built from unlike units is
