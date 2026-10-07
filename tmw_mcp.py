@@ -295,6 +295,131 @@ def summarize_orders(
     )
 
 
+@mcp.tool()
+def get_order_freight(orders: list[str], stop_type: str = "DRP") -> list[dict]:
+    """Get the freight lines (commodity, weight, count, temperature, dimensions) for orders.
+
+    The same freight is written onto pickup, delivery and in-transit stops. On an
+    order with more than one pickup or delivery those copies can disagree, and the
+    DRP (delivery) copies are the authoritative record — so DRP is the default.
+
+    stop_type: "DRP" (deliveries, the default and the source of truth), "PUP"
+    (pickups), "NONE" (in-transit stops), or "ANY" for every copy.
+
+    Use summarize_order_freight instead when you want per-order totals rather than
+    individual lines.
+    """
+    return db.get_order_freight(orders, stop_type)
+
+
+@mcp.tool()
+def summarize_order_freight(orders: list[str]) -> list[dict]:
+    """Get per-order freight totals, with the pickup figures alongside for comparison.
+
+    Returns one row per order: total weight, pieces, temperature range, largest
+    dimensions and the commodity codes, all taken from the authoritative DRP
+    (delivery) stops.
+
+    Also returns pup_weight and pup_pieces from the pickup stops and an in_sync
+    flag. When in_sync is false the pickup and delivery records disagree, which
+    happens on orders with several pickups or deliveries — report the DRP figure
+    as the real one, and mention the discrepancy rather than hiding it.
+
+    Pair this with search_orders: search first, then pass the returned
+    ord_hdrnumber values here to attach freight to them.
+    """
+    return db.summarize_order_freight(orders)
+
+
+@mcp.tool()
+def search_freight(
+    stop_type: str = "DRP",
+    commodities: list[str] | None = None,
+    commodity_class: list[str] | None = None,
+    description: str | None = None,
+    orders: list[str] | None = None,
+    stops: list[str] | None = None,
+    freight_numbers: list[str] | None = None,
+    min_weight: float | None = None,
+    max_weight: float | None = None,
+    min_count: float | None = None,
+    temp_controlled: bool | None = None,
+    min_temp: float | None = None,
+    max_temp: float | None = None,
+    has_dimensions: bool | None = None,
+    min_length: float | None = None,
+    min_width: float | None = None,
+    min_height: float | None = None,
+    started_after: str | None = None,
+    started_before: str | None = None,
+    completed_after: str | None = None,
+    completed_before: str | None = None,
+    billto: list[str] | None = None,
+    shipper: list[str] | None = None,
+    consignee: list[str] | None = None,
+    status: list[str] | None = None,
+    revtype1: list[str] | None = None,
+    revtype2: list[str] | None = None,
+    origin_state: list[str] | None = None,
+    dest_state: list[str] | None = None,
+    origin_city: list[int] | None = None,
+    dest_city: list[int] | None = None,
+    limit: int = 200,
+) -> dict:
+    """Search freight lines by commodity, weight, temperature, dimensions, and order.
+
+    At least one filter is required. Order-level filters (dates, billto, shipper,
+    consignee, status, revenue types, origin and destination) work here too, so
+    "oversize freight for this customer last quarter" is a single call.
+
+    stop_type defaults to "DRP" — the delivery copies, which are the authoritative
+    record. Use "PUP" for pickups, "NONE" for in-transit stops, or "ANY" for all.
+    Most freight rows sit on in-transit stops, so searching "ANY" returns several
+    copies of the same freight.
+
+    temp_controlled true returns only freight with a temperature set; has_dimensions
+    true returns only freight with length, width or height recorded (oversize loads).
+    description matches with SQL LIKE, so wrap it in % wildcards. It is a freeform
+    user-editable field — filter on commodities for anything reliable.
+
+    Returns {"freight": [...], "count": n, "truncated": bool, "stop_type": str}.
+    When truncated is true more rows matched than were returned.
+    """
+    return db.search_freight(
+        stop_type=stop_type,
+        limit=limit,
+        commodities=commodities,
+        commodity_class=commodity_class,
+        description=description,
+        orders=orders,
+        stops=stops,
+        freight_numbers=freight_numbers,
+        min_weight=min_weight,
+        max_weight=max_weight,
+        min_count=min_count,
+        temp_controlled=temp_controlled,
+        min_temp=min_temp,
+        max_temp=max_temp,
+        has_dimensions=has_dimensions,
+        min_length=min_length,
+        min_width=min_width,
+        min_height=min_height,
+        started_after=started_after,
+        started_before=started_before,
+        completed_after=completed_after,
+        completed_before=completed_before,
+        billto=billto,
+        shipper=shipper,
+        consignee=consignee,
+        status=status,
+        revtype1=revtype1,
+        revtype2=revtype2,
+        origin_state=origin_state,
+        dest_state=dest_state,
+        origin_city=origin_city,
+        dest_city=dest_city,
+    )
+
 class BearerAuthMiddleware:
     """Require `Authorization: Bearer <key>` on every HTTP request.
 

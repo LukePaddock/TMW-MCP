@@ -270,6 +270,9 @@ in `labelfile` under `InvoiceStatus` and `PayStatus`.
 | `search_orders` | many optional filters | Orders by date, customer, location, revenue type — see below |
 | `summarize_orders` | `group_by` + same filters | Aggregated order totals instead of rows |
 | `find_city_codes` | `name`, `state` | Resolve a city name to the numeric codes orders store |
+| `get_order_freight` | `orders`, `stop_type` | Freight lines per order; DRP (delivery) copies by default |
+| `summarize_order_freight` | `orders` | Per-order freight totals, with PUP vs DRP `in_sync` flag |
+| `search_freight` | freight + order filters | Freight by commodity, weight, temperature, dimensions |
 
 ## Database Layer (`tmw_db.py`)
 
@@ -310,6 +313,65 @@ so match on `cty_name` and `cty_state`, which is what `resolve_cities` does.
 
 Location has three precisions, exposed as separate filters rather than guessed at:
 `origin_company` (a `cmp_id`, most precise), `origin_city` (code), `origin_state`.
+
+### Freight Detail
+
+Freight lines live in `freightdetail` and hang off **stops**, never off orders
+directly. `freightdetail.order_hdrnumber` exists and is indexed but is **NULL on
+all 1.64M rows** in this database, so the path is always
+`freightdetail -> stops -> orderheader`.
+
+`stops.stp_type` is the field that matters: `PUP`, `DRP` or `NONE`.
+
+| stp_type | Freight rows | Meaning |
+|----------|-------------|---------|
+| `NONE` | 849k | In-transit copies on `DLT` / `HLT` / `BMT` stops |
+| `DRP` | 367k | Deliveries — **the authoritative record** |
+| `PUP` | 343k | Pickups |
+
+A stop may carry **more than one freight row** — rare (about 1,024 stops of 1.64M,
+at most 7 rows) but legitimate, such as five commodities delivered to one stop. All
+three tools handle it: they key on `fgt_number` and aggregate with `SUM`/`COUNT`
+rather than assuming one row per stop, and `summarize_order_freight` reports
+`drp_lines` (freight rows) separately from `drp_stops` (distinct stops).
+
+`fgt_sequence` is **not unique within a stop** — some stops have every row at
+sequence 1 — so every `ORDER BY` ends with `fgt_number` to keep the ordering
+total. Without that tiebreaker, which rows fall inside `TOP (?)` could vary
+between identical calls.
+
+The same freight is written onto every stop it passes through, so **filtering by
+`stp_type` is not optional** — most rows are in-transit duplicates. All freight
+tools default to `DRP`.
+
+On an order with more than one pickup or delivery, the PUP and DRP copies can
+disagree. DRP is the truth. `summarize_order_freight` returns the DRP figures as
+the headline numbers plus `pup_weight` / `pup_pieces` and an `in_sync` flag, so a
+discrepancy is visible rather than hidden behind a single total. Measured on a
+200-order sample: 196 agreed, 3 differed.
+
+`stp_type='DRP'` corresponds to `stp_event='LUL'` (Live Unload) for 363,159 of
+366,824 stops. Note there is **no `stp_event` value of `DRP`** — that code does
+not exist in this database. `eventcodetable.fgt_event` carries an equivalent
+PUP/DRP classification and agrees with `stp_type` on all but one row, but
+`stp_type` is used because it needs one fewer join.
+
+`fgt_description` is populated from the selected `cmd_code` but is freeform and
+user-editable, so filter on `commodities` (the `cmd_code`) for anything that has
+to be reliable, and treat the description as a display field.
+
+Units are stored per row and are not normalised: `fgt_weightunit` is mostly `LBS`
+with some `KGS`, `TON` and `MTN`; `fgt_countunit` includes `PCS`, `PLT`, `COIL`
+and `CAS`. Summing weight across rows therefore mixes units — report the unit
+alongside any total rather than assuming pounds.
+
+**`search_freight` uses a deferred join**, and must keep doing so. Selecting all
+26 output columns across five tables in the same query as the `TOP` / `ORDER BY`
+makes the optimiser abandon the ordered scan the row goal allows: `min_weight`
+plus a date range took **24 seconds**. Picking `fgt_number` first with a narrow
+projection, then widening over at most `limit` rows, returns the identical result
+in **~450ms**. Adding an output column to the wide half is safe; moving the
+filtering and ordering into it is not.
 
 ### Adding a New Tool
 

@@ -55,6 +55,52 @@ _ORDER_GROUPS: dict[str, tuple[str, str | None]] = {
     "year":           ("CONVERT(char(4), oh.ord_startdate, 126)", None),
 }
 
+# --- Freight search ------------------------------------------------------
+#
+# Freight lines hang off stops, not orders: freightdetail.order_hdrnumber exists
+# and is indexed but is NULL on every row in this database, so the link is
+# always freightdetail -> stops -> orderheader.
+#
+# A stop may carry more than one freight row - rare (about 1,024 stops of 1.64M,
+# at most 7 rows) but legitimate, e.g. five commodities delivered to one stop.
+# Everything here keys on fgt_number and aggregates with SUM/COUNT rather than
+# assuming one row per stop. fgt_sequence is not unique within a stop, so every
+# ORDER BY ends with fgt_number to keep the order total.
+#
+# stops.stp_type is 'PUP', 'DRP' or 'NONE'. The same freight is written onto
+# load, unload and in-transit stops, and on an order with several pickups or
+# drops the PUP and DRP copies can disagree - the DRP rows are treated as the
+# authoritative record. Of 1.64M freight rows, 849k sit on NONE stops, so
+# filtering by stop type is not optional.
+
+_FREIGHT_FILTERS: dict[str, tuple[str, str]] = {
+    "freight_numbers":  ("f.fgt_number IN ({ph})", "list"),
+    "stops":            ("f.stp_number IN ({ph})", "list"),
+    "commodities":      ("f.cmd_code IN ({ph})", "list"),
+    "commodity_class":  ("cm.cmd_class IN ({ph})", "list"),
+    "description":      ("f.fgt_description LIKE ?", "scalar"),
+    "min_weight":       ("f.fgt_weight >= ?", "scalar"),
+    "max_weight":       ("f.fgt_weight <= ?", "scalar"),
+    "min_count":        ("f.fgt_count >= ?", "scalar"),
+    "min_length":       ("f.fgt_length >= ?", "scalar"),
+    "min_width":        ("f.fgt_width >= ?", "scalar"),
+    "min_height":       ("f.fgt_height >= ?", "scalar"),
+    "max_temp":         ("f.fgt_hitemp <= ?", "scalar"),
+    "min_temp":         ("f.fgt_lowtemp >= ?", "scalar"),
+    # Flags take no parameter - the fragment is the whole predicate.
+    "temp_controlled":  ("(f.fgt_lowtemp IS NOT NULL OR f.fgt_hitemp IS NOT NULL)", "flag"),
+    "has_dimensions":   ("(f.fgt_length > 0 OR f.fgt_width > 0 OR f.fgt_height > 0)", "flag"),
+}
+
+_FREIGHT_FROM = """
+    FROM freightdetail f
+    JOIN stops s           ON s.stp_number = f.stp_number
+    LEFT JOIN orderheader oh ON oh.ord_hdrnumber = s.ord_hdrnumber
+    LEFT JOIN commodity cm ON cm.cmd_code = f.cmd_code
+    LEFT JOIN city cty     ON cty.cty_code = s.stp_city
+    LEFT JOIN company c    ON c.cmp_id = s.cmp_id
+"""
+
 _ORDER_FROM = """
     FROM orderheader oh
     LEFT JOIN city ocity  ON ocity.cty_code = oh.ord_origincity
@@ -76,21 +122,25 @@ def _coerce_date(value):
         ) from None
 
 
-def _build_where(filters: dict) -> tuple[str, list]:
+def _build_where(filters: dict, spec_table: dict | None = None) -> tuple[str, list]:
     """Turn a dict of filters into a WHERE clause and its parameters.
+
+    `spec_table` defaults to the order filters; freight searches pass the merged
+    freight + order table so one assembler serves both.
 
     Unknown filter names raise rather than being silently ignored, so a
     mistyped filter can never widen the result set.
     """
+    table = _ORDER_FILTERS if spec_table is None else spec_table
     clauses: list[str] = []
     params: list = []
 
     for name, value in filters.items():
         if value is None:
             continue
-        spec = _ORDER_FILTERS.get(name)
+        spec = table.get(name)
         if spec is None:
-            valid = ", ".join(sorted(_ORDER_FILTERS))
+            valid = ", ".join(sorted(table))
             raise ValueError(f"Unknown filter {name!r}. Valid filters: {valid}")
         fragment, kind = spec
 
@@ -100,6 +150,10 @@ def _build_where(filters: dict) -> tuple[str, list]:
                 continue
             clauses.append(fragment.format(ph=", ".join("?" * len(values))))
             params.extend(values)
+        elif kind == "flag":
+            # Only a true value applies the predicate; false means "don't care".
+            if value:
+                clauses.append(fragment)
         elif kind == "date":
             clauses.append(fragment)
             params.append(_coerce_date(value))
@@ -698,3 +752,232 @@ class TmwDB:
             "count": min(len(rows), limit),
             "truncated": truncated,
         }
+
+    def _freight_row_to_dict(self, row) -> dict:
+        return {
+            "fgt_number": row[0],
+            "ord_hdrnumber": row[1],
+            "stp_number": row[2],
+            "stop_type": (row[3] or "").strip() or None,
+            "stp_event": (row[4] or "").strip() or None,
+            "stop_city": row[5],
+            "cmp_id": row[6],
+            "company_name": row[7],
+            "cmd_code": (row[8] or "").strip() or None,
+            "commodity_name": row[9],
+            "commodity_class": (row[10] or "").strip() or None,
+            "description": row[11],
+            "weight": row[12],
+            "weight_unit": (row[13] or "").strip() or None,
+            "count": row[14],
+            "count_unit": (row[15] or "").strip() or None,
+            "volume": row[16],
+            "volume_unit": (row[17] or "").strip() or None,
+            "low_temp": row[18],
+            "high_temp": row[19],
+            "temp_unit": (row[20] or "").strip() or None,
+            "length": row[21],
+            "width": row[22],
+            "height": row[23],
+            "dimension_unit": (row[24] or "").strip() or None,
+            "sequence": row[25],
+        }
+
+    _FREIGHT_SELECT = """
+        f.fgt_number,
+        s.ord_hdrnumber,
+        f.stp_number,
+        s.stp_type,
+        s.stp_event,
+        cty.cty_nmstct AS stop_city,
+        s.cmp_id,
+        c.cmp_name,
+        f.cmd_code,
+        cm.cmd_name,
+        cm.cmd_class,
+        f.fgt_description,
+        f.fgt_weight,
+        f.fgt_weightunit,
+        f.fgt_count,
+        f.fgt_countunit,
+        f.fgt_volume,
+        f.fgt_volumeunit,
+        f.fgt_lowtemp,
+        f.fgt_hitemp,
+        f.fgt_tempunit,
+        f.fgt_length,
+        f.fgt_width,
+        f.fgt_height,
+        f.fgt_lengthunit,
+        f.fgt_sequence
+    """
+
+    def search_freight(
+        self, stop_type: str | None = "DRP", limit: int | None = None, **filters
+    ) -> dict:
+        """Search freight lines, defaulting to the authoritative DRP copies.
+
+        Accepts freight filters and, because orderheader is joined as `oh`, every
+        order filter too - so "oversize freight for this customer last quarter"
+        is a single query. A `stop_type` of None or "ANY" searches every copy.
+        """
+        if not self.conn:
+            self.connect()
+
+        limit = min(limit or self.max_search_rows, self.max_search_rows)
+        merged = {**_FREIGHT_FILTERS, **_ORDER_FILTERS}
+        where, params = _build_where(filters, merged)
+
+        if stop_type and stop_type.upper() != "ANY":
+            where = f"({where}) AND s.stp_type = ?"
+            params = [*params, stop_type.upper()]
+
+        # Deferred join. Selecting all 26 columns across five tables in the same
+        # query as the TOP/ORDER BY makes the optimiser abandon the cheap ordered
+        # scan that the row goal allows, and a filter such as min_weight plus a
+        # date range then took 24s. Picking the keys with a narrow projection
+        # first, then widening over at most `limit` rows, is ~400ms for the same
+        # result - a 56x difference measured on this data.
+        cursor = self.conn.cursor()
+        cursor.execute(f"""
+            WITH picked AS (
+                SELECT TOP (?) f.fgt_number
+                {_FREIGHT_FROM}
+                WHERE {where}
+                ORDER BY s.ord_hdrnumber DESC, f.stp_number, f.fgt_sequence, f.fgt_number
+            )
+            SELECT
+                {self._FREIGHT_SELECT}
+            FROM picked
+            JOIN freightdetail f   ON f.fgt_number = picked.fgt_number
+            JOIN stops s           ON s.stp_number = f.stp_number
+            LEFT JOIN commodity cm ON cm.cmd_code = f.cmd_code
+            LEFT JOIN city cty     ON cty.cty_code = s.stp_city
+            LEFT JOIN company c    ON c.cmp_id = s.cmp_id
+            ORDER BY s.ord_hdrnumber DESC, f.stp_number, f.fgt_sequence, f.fgt_number
+        """, [limit + 1, *params])
+
+        rows = cursor.fetchall()
+        return {
+            "freight": [self._freight_row_to_dict(r) for r in rows[:limit]],
+            "count": min(len(rows), limit),
+            "truncated": len(rows) > limit,
+            "stop_type": (stop_type or "ANY").upper(),
+        }
+
+    def get_order_freight(
+        self, order_ids: list[str], stop_type: str | None = "DRP"
+    ) -> list[dict]:
+        """Every freight line for the given orders, DRP copies by default."""
+        if not order_ids:
+            return []
+
+        if not self.conn:
+            self.connect()
+
+        placeholders = ", ".join("?" * len(order_ids))
+        params: list = list(order_ids)
+        clause = ""
+        if stop_type and stop_type.upper() != "ANY":
+            clause = " AND s.stp_type = ?"
+            params.append(stop_type.upper())
+
+        cursor = self.conn.cursor()
+        cursor.execute(f"""
+            SELECT
+                {self._FREIGHT_SELECT}
+            {_FREIGHT_FROM}
+            WHERE s.ord_hdrnumber IN ({placeholders}){clause}
+            ORDER BY s.ord_hdrnumber, s.stp_type DESC, f.stp_number, f.fgt_sequence, f.fgt_number
+        """, params)
+
+        return [self._freight_row_to_dict(r) for r in cursor.fetchall()]
+
+    def summarize_order_freight(self, order_ids: list[str]) -> list[dict]:
+        """Per-order freight totals for the PUP and DRP copies, and whether they agree.
+
+        On an order with more than one pickup or drop the two copies can drift.
+        DRP is the authoritative figure; `in_sync` flags where PUP disagrees, so a
+        discrepancy is visible rather than silently hidden behind one number.
+        """
+        if not order_ids:
+            return []
+
+        if not self.conn:
+            self.connect()
+
+        placeholders = ", ".join("?" * len(order_ids))
+        cursor = self.conn.cursor()
+        cursor.execute(f"""
+            WITH per_class AS (
+                SELECT
+                    s.ord_hdrnumber,
+                    s.stp_type,
+                    COUNT(*)                     AS lines,
+                    COUNT(DISTINCT s.stp_number) AS stops,
+                    SUM(f.fgt_weight)            AS weight,
+                    SUM(f.fgt_count)             AS pieces,
+                    MIN(f.fgt_lowtemp)           AS low_temp,
+                    MAX(f.fgt_hitemp)            AS high_temp,
+                    MAX(f.fgt_length)            AS max_length,
+                    MAX(f.fgt_width)             AS max_width,
+                    MAX(f.fgt_height)            AS max_height
+                FROM freightdetail f
+                JOIN stops s ON s.stp_number = f.stp_number
+                WHERE s.ord_hdrnumber IN ({placeholders})
+                  AND s.stp_type IN ('PUP', 'DRP')
+                GROUP BY s.ord_hdrnumber, s.stp_type
+            ),
+            commodities AS (
+                SELECT s3.ord_hdrnumber,
+                       STRING_AGG(cmd, ',') AS cmd_list
+                FROM (
+                    SELECT DISTINCT s2.ord_hdrnumber,
+                           LTRIM(RTRIM(f2.cmd_code)) AS cmd
+                    FROM freightdetail f2
+                    JOIN stops s2 ON s2.stp_number = f2.stp_number
+                    WHERE s2.ord_hdrnumber IN ({placeholders})
+                      AND s2.stp_type = 'DRP'
+                      AND f2.cmd_code IS NOT NULL
+                ) s3
+                GROUP BY s3.ord_hdrnumber
+            )
+            SELECT
+                COALESCE(d.ord_hdrnumber, p.ord_hdrnumber) AS ord_hdrnumber,
+                d.lines, d.stops, d.weight, d.pieces,
+                d.low_temp, d.high_temp, d.max_length, d.max_width, d.max_height,
+                p.lines, p.stops, p.weight, p.pieces,
+                cd.cmd_list
+            FROM (SELECT * FROM per_class WHERE stp_type = 'DRP') d
+            FULL OUTER JOIN (SELECT * FROM per_class WHERE stp_type = 'PUP') p
+                ON p.ord_hdrnumber = d.ord_hdrnumber
+            LEFT JOIN commodities cd
+                ON cd.ord_hdrnumber = COALESCE(d.ord_hdrnumber, p.ord_hdrnumber)
+            ORDER BY 1
+        """, [*order_ids, *order_ids])
+
+        out = []
+        for row in cursor.fetchall():
+            drp_weight, pup_weight = row[3], row[12]
+            drp_pieces, pup_pieces = row[4], row[13]
+            out.append({
+                "ord_hdrnumber": row[0],
+                # DRP is the authoritative copy.
+                "drp_lines": row[1],
+                "drp_stops": row[2],
+                "weight": drp_weight,
+                "pieces": drp_pieces,
+                "low_temp": row[5],
+                "high_temp": row[6],
+                "max_length": row[7],
+                "max_width": row[8],
+                "max_height": row[9],
+                "commodities": row[14],
+                # PUP copy, for comparison only.
+                "pup_lines": row[10],
+                "pup_stops": row[11],
+                "pup_weight": pup_weight,
+                "pup_pieces": pup_pieces,
+                "in_sync": (drp_weight == pup_weight and drp_pieces == pup_pieces),
+            })
+        return out

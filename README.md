@@ -302,6 +302,9 @@ compose.yml.example     Container config template (copy to compose.yml)
 | `search_orders` | many optional filters | Orders by date, customer, location, revenue type |
 | `summarize_orders` | `group_by` + same filters | Aggregated order totals instead of rows |
 | `find_city_codes` | `name`, `state` | Resolve a city name to the numeric codes orders store |
+| `get_order_freight` | `orders`, `stop_type` | Freight lines per order; DRP (delivery) copies by default |
+| `summarize_order_freight` | `orders` | Per-order freight totals, with PUP vs DRP `in_sync` flag |
+| `search_freight` | freight + order filters | Freight by commodity, weight, temperature, dimensions |
 
 `search_orders` and `summarize_orders` share one filter set: date ranges,
 `billto`, `shipper`, `consignee`, `status`, `invoice_status`, `revtype1`-`4`,
@@ -312,6 +315,23 @@ complete one.
 
 Order origin and destination cities are stored as integer codes, so resolve a
 name with `find_city_codes` first.
+
+### Freight
+
+Freight lines hang off **stops**, not orders, and the same freight is written onto
+pickup, delivery and in-transit stops. `stops.stp_type` distinguishes them —
+`PUP`, `DRP` or `NONE` — and most of the 1.64M rows are `NONE` (in-transit
+duplicates), so every freight tool defaults to `DRP`, the delivery copies, which
+are the authoritative record.
+
+On orders with several pickups or deliveries the two copies can drift.
+`summarize_order_freight` reports the DRP figures plus the pickup totals and an
+`in_sync` flag, so a mismatch is surfaced rather than hidden.
+
+`search_freight` accepts order-level filters too, so "oversize freight for this
+customer last quarter" is one call. Weight and count units are stored per row and
+are not normalised (`LBS`, `KGS`, `TON`, `PCS`, `PLT`, `COIL`), so report the unit
+with any total.
 
 ## Data model
 
