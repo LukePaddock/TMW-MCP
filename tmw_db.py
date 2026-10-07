@@ -73,14 +73,46 @@ _ORDER_GROUPS: dict[str, tuple[str, str | None]] = {
 # authoritative record. Of 1.64M freight rows, 849k sit on NONE stops, so
 # filtering by stop type is not optional.
 
+# Weight is stored per row with its own unit and is not normalised. Only KGS is
+# converted: TON and MTN are mislabelled pounds in this database - the largest TON
+# values are ~61,460, which as short tons would be 123 million lbs - so they, and
+# rows with an unknown or missing unit, are treated as pounds. 574,797 LBS rows
+# and 8,832 KGS rows are 99.97% of all rows carrying a weight.
+_KG_TO_LBS = 2.20462
+_WEIGHT_BASES = ("LBS", "KGS")
+
+# Normalises fgt_weight to pounds. Wrapping the column makes the predicate
+# non-sargable, which costs nothing here: freightdetail has no index on
+# fgt_weight.
+_WEIGHT_LBS = (
+    "(CASE WHEN LTRIM(RTRIM(f.fgt_weightunit)) = 'KGS' "
+    f"THEN f.fgt_weight * {_KG_TO_LBS} ELSE f.fgt_weight END)"
+)
+
+
+def _to_lbs(value, basis: str):
+    """Convert a caller-supplied weight threshold into pounds."""
+    if value is None:
+        return None
+    if basis == "KGS":
+        return value * _KG_TO_LBS
+    return value
+
+
 _FREIGHT_FILTERS: dict[str, tuple[str, str]] = {
     "freight_numbers":  ("f.fgt_number IN ({ph})", "list"),
     "stops":            ("f.stp_number IN ({ph})", "list"),
     "commodities":      ("f.cmd_code IN ({ph})", "list"),
     "commodity_class":  ("cm.cmd_class IN ({ph})", "list"),
     "description":      ("f.fgt_description LIKE ?", "scalar"),
-    "min_weight":       ("f.fgt_weight >= ?", "scalar"),
-    "max_weight":       ("f.fgt_weight <= ?", "scalar"),
+    # Compared in pounds. search_freight converts the threshold first, so a
+    # caller can express it in kilograms via weight_basis.
+    "min_weight":       (f"{_WEIGHT_LBS} >= ?", "scalar"),
+    "max_weight":       (f"{_WEIGHT_LBS} <= ?", "scalar"),
+    "weight_unit":      ("LTRIM(RTRIM(f.fgt_weightunit)) IN ({ph})", "list"),
+    # Counts are NOT converted - PCS, PLT, COIL and CAS have no fixed ratio -
+    # so filter by unit instead of hoping a threshold means one thing.
+    "count_unit":       ("LTRIM(RTRIM(f.fgt_countunit)) IN ({ph})", "list"),
     "min_count":        ("f.fgt_count >= ?", "scalar"),
     "min_length":       ("f.fgt_length >= ?", "scalar"),
     "min_width":        ("f.fgt_width >= ?", "scalar"),
@@ -769,6 +801,12 @@ class TmwDB:
             "description": row[11],
             "weight": row[12],
             "weight_unit": (row[13] or "").strip() or None,
+            # Same weight in pounds, so rows with mixed units are comparable.
+            "weight_lbs": (
+                round(row[12] * _KG_TO_LBS, 2)
+                if row[12] is not None and (row[13] or "").strip().upper() == "KGS"
+                else row[12]
+            ),
             "count": row[14],
             "count_unit": (row[15] or "").strip() or None,
             "volume": row[16],
@@ -813,16 +851,34 @@ class TmwDB:
     """
 
     def search_freight(
-        self, stop_type: str | None = "DRP", limit: int | None = None, **filters
+        self,
+        stop_type: str | None = "DRP",
+        weight_basis: str = "LBS",
+        limit: int | None = None,
+        **filters,
     ) -> dict:
         """Search freight lines, defaulting to the authoritative DRP copies.
 
         Accepts freight filters and, because orderheader is joined as `oh`, every
         order filter too - so "oversize freight for this customer last quarter"
         is a single query. A `stop_type` of None or "ANY" searches every copy.
+
+        `min_weight` / `max_weight` are compared in pounds after normalising each
+        row. `weight_basis` says which unit the threshold itself is in, so
+        min_weight=10000 with weight_basis="KGS" means 10,000 kg and matches a
+        22,046 lb row.
         """
         if not self.conn:
             self.connect()
+
+        basis = (weight_basis or "LBS").upper()
+        if basis not in _WEIGHT_BASES:
+            raise ValueError(
+                f"weight_basis must be one of {', '.join(_WEIGHT_BASES)}, got {weight_basis!r}"
+            )
+        for bound in ("min_weight", "max_weight"):
+            if filters.get(bound) is not None:
+                filters[bound] = _to_lbs(filters[bound], basis)
 
         limit = min(limit or self.max_search_rows, self.max_search_rows)
         merged = {**_FREIGHT_FILTERS, **_ORDER_FILTERS}
@@ -863,6 +919,8 @@ class TmwDB:
             "count": min(len(rows), limit),
             "truncated": len(rows) > limit,
             "stop_type": (stop_type or "ANY").upper(),
+            "weight_compared_in": "LBS",
+            "weight_basis": basis,
         }
 
     def get_order_freight(
@@ -915,8 +973,11 @@ class TmwDB:
                     s.stp_type,
                     COUNT(*)                     AS lines,
                     COUNT(DISTINCT s.stp_number) AS stops,
-                    SUM(f.fgt_weight)            AS weight,
+                    -- Summed in pounds; a raw SUM would add KGS to LBS.
+                    SUM({_WEIGHT_LBS})           AS weight,
                     SUM(f.fgt_count)             AS pieces,
+                    COUNT(DISTINCT NULLIF(LTRIM(RTRIM(f.fgt_weightunit)), '')) AS weight_units,
+                    COUNT(DISTINCT NULLIF(LTRIM(RTRIM(f.fgt_countunit)), ''))  AS count_units,
                     MIN(f.fgt_lowtemp)           AS low_temp,
                     MAX(f.fgt_hitemp)            AS high_temp,
                     MAX(f.fgt_length)            AS max_length,
@@ -947,7 +1008,8 @@ class TmwDB:
                 d.lines, d.stops, d.weight, d.pieces,
                 d.low_temp, d.high_temp, d.max_length, d.max_width, d.max_height,
                 p.lines, p.stops, p.weight, p.pieces,
-                cd.cmd_list
+                cd.cmd_list,
+                d.weight_units, d.count_units
             FROM (SELECT * FROM per_class WHERE stp_type = 'DRP') d
             FULL OUTER JOIN (SELECT * FROM per_class WHERE stp_type = 'PUP') p
                 ON p.ord_hdrnumber = d.ord_hdrnumber
@@ -973,6 +1035,13 @@ class TmwDB:
                 "max_width": row[8],
                 "max_height": row[9],
                 "commodities": row[14],
+                # Weight is normalised to pounds before summing. Counts are not
+                # converted, so a true mixed_count_units means `pieces` adds
+                # unlike units (PCS to PLT to COIL) and should not be trusted
+                # as a single figure.
+                "weight_unit": "LBS",
+                "mixed_weight_units": (row[15] or 0) > 1,
+                "mixed_count_units": (row[16] or 0) > 1,
                 # PUP copy, for comparison only.
                 "pup_lines": row[10],
                 "pup_stops": row[11],

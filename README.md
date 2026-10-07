@@ -329,9 +329,18 @@ On orders with several pickups or deliveries the two copies can drift.
 `in_sync` flag, so a mismatch is surfaced rather than hidden.
 
 `search_freight` accepts order-level filters too, so "oversize freight for this
-customer last quarter" is one call. Weight and count units are stored per row and
-are not normalised (`LBS`, `KGS`, `TON`, `PCS`, `PLT`, `COIL`), so report the unit
-with any total.
+customer last quarter" is one call.
+
+Weight is stored per row with its own unit. `min_weight` / `max_weight` compare
+after normalising every row to pounds, and `weight_basis` says which unit your
+threshold is in - `min_weight=10000, weight_basis="KGS"` means 10,000 kg. Only
+`KGS` is converted; `TON` and `MTN` are mislabelled pounds in this data. Use
+`weight_unit` to scope to rows stored in one unit.
+
+Counts are not converted, since `PCS`, `PLT` and `COIL` have no fixed ratio - pair
+`min_count` with `count_unit`. `summarize_order_freight` flags
+`mixed_weight_units` and `mixed_count_units` so a total built from unlike units is
+visible.
 
 ## Data model
 

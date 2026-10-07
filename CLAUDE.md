@@ -360,6 +360,31 @@ PUP/DRP classification and agrees with `stp_type` on all but one row, but
 user-editable, so filter on `commodities` (the `cmd_code`) for anything that has
 to be reliable, and treat the description as a display field.
 
+**Weight is normalised to pounds; counts are not normalised at all.**
+
+`_WEIGHT_LBS` converts `fgt_weight` to pounds in SQL, and `min_weight` /
+`max_weight` compare against it. `weight_basis` says which unit the caller's
+threshold is in, so `min_weight=10000, weight_basis="KGS"` means 10,000 kg and
+matches a 22,046 lb row. `summarize_order_freight` sums the normalised value and
+sets `mixed_weight_units` when more than one source unit contributed. Order 70475
+mixes 5 KGS lines with 1 LBS line: the normalised total is 167,247 lbs, where a raw
+SUM gave 114,110 - a 32% understatement.
+
+**Only KGS is converted.** `TON` and `MTN` are mislabelled pounds in this data -
+the largest `TON` values are around 61,460, which as short tons would be 123
+million lbs - so they, and rows with a missing or unknown unit, are treated as
+pounds. That covers 169 rows; `LBS` and `KGS` are 99.97% of rows with a weight.
+
+**Counts have no conversion** because `PCS`, `PLT`, `COIL` and `CAS` have no fixed
+ratio. `min_count` therefore spans unlike units unless paired with `count_unit`,
+and `summarize_order_freight` sets `mixed_count_units` when `pieces` added
+different units - treat that total as unreliable rather than real.
+
+**Stored weights contain bad data.** 27,033 LBS rows exceed 80,000 lbs, 87 exceed
+1,000,000 and the largest is 505,000,010,266. Average LBS weight is 922,260, far
+above a legal truckload, so the inflation is not confined to a few rows. Any
+weight aggregate should be read with that in mind.
+
 Units are stored per row and are not normalised: `fgt_weightunit` is mostly `LBS`
 with some `KGS`, `TON` and `MTN`; `fgt_countunit` includes `PCS`, `PLT`, `COIL`
 and `CAS`. Summing weight across rows therefore mixes units — report the unit

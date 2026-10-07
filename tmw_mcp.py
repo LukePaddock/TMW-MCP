@@ -320,6 +320,11 @@ def summarize_order_freight(orders: list[str]) -> list[dict]:
     dimensions and the commodity codes, all taken from the authoritative DRP
     (delivery) stops.
 
+    Weight is normalised to POUNDS before summing, so an order mixing LBS and KGS
+    rows totals correctly; mixed_weight_units says whether that happened. Counts
+    are NOT converted, and mixed_count_units true means `pieces` adds unlike units
+    (PCS, PLT, COIL), so report it as unreliable rather than as a total.
+
     Also returns pup_weight and pup_pieces from the pickup stops and an in_sync
     flag. When in_sync is false the pickup and delivery records disagree, which
     happens on orders with several pickups or deliveries — report the DRP figure
@@ -334,6 +339,9 @@ def summarize_order_freight(orders: list[str]) -> list[dict]:
 @mcp.tool()
 def search_freight(
     stop_type: str = "DRP",
+    weight_basis: str = "LBS",
+    weight_unit: list[str] | None = None,
+    count_unit: list[str] | None = None,
     commodities: list[str] | None = None,
     commodity_class: list[str] | None = None,
     description: str | None = None,
@@ -382,12 +390,32 @@ def search_freight(
     description matches with SQL LIKE, so wrap it in % wildcards. It is a freeform
     user-editable field — filter on commodities for anything reliable.
 
-    Returns {"freight": [...], "count": n, "truncated": bool, "stop_type": str}.
-    When truncated is true more rows matched than were returned.
+    WEIGHT AND UNITS. Weight is stored per row with its own unit. min_weight and
+    max_weight are compared after normalising every row to pounds, and weight_basis
+    says which unit your threshold is in: min_weight=10000 with weight_basis="KGS"
+    means 10,000 kg and matches a 22,046 lb row. Only KGS is converted; TON and MTN
+    are mislabelled pounds in this data and are treated as pounds. Each result
+    carries the stored weight with its weight_unit, plus weight_lbs.
+
+    Use weight_unit to restrict to rows stored in a given unit instead, e.g.
+    weight_unit=["KGS"].
+
+    COUNTS ARE NOT CONVERTED. PCS, PLT, COIL and CAS have no fixed ratio, so a
+    min_count threshold spans unlike units. Pair it with count_unit, e.g.
+    count_unit=["PLT"], for a comparison that means something.
+
+    The stored weights contain bad data: 87 rows exceed 1,000,000 lbs and the
+    largest is 505 billion. Treat extreme values as suspect rather than real.
+
+    Returns {"freight": [...], "count": n, "truncated": bool, "stop_type": str,
+    "weight_basis": str}. When truncated is true more rows matched than returned.
     """
     return db.search_freight(
         stop_type=stop_type,
+        weight_basis=weight_basis,
         limit=limit,
+        weight_unit=weight_unit,
+        count_unit=count_unit,
         commodities=commodities,
         commodity_class=commodity_class,
         description=description,
