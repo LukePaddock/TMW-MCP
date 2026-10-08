@@ -269,6 +269,7 @@ def search_stops(
     origin_state: list[str] | None = None,
     dest_state: list[str] | None = None,
     min_charge: float | None = None,
+    currency: list[str] | None = None,
     limit: int = 200,
 ) -> dict:
     """Search stops by identity, status, date, appointment, location, driver, or truck.
@@ -390,6 +391,7 @@ def search_stops(
         origin_state=origin_state,
         dest_state=dest_state,
         min_charge=min_charge,
+        currency=currency,
     )
 
 
@@ -441,6 +443,7 @@ def search_orders(
     origin_state: list[str] | None = None,
     dest_state: list[str] | None = None,
     min_charge: float | None = None,
+    currency: list[str] | None = None,
     orders: list[int] | None = None,
     order_numbers: list[str] | None = None,
     limit: int = 200,
@@ -456,6 +459,19 @@ def search_orders(
 
     Order statuses here are CMP (completed), CAN (cancelled), QTE (quote), AVL,
     PLN, STD, PND — not the AVL/PLN/STD/DNE set used for legs and movements.
+
+    CURRENCY. This is a mixed-currency database — 84% of orders are Canadian
+    dollars, 16% US — so total_charge means nothing without the currency beside
+    it. Every result carries `currency` (the stored label, e.g. 'CA$') and
+    `currency_code` (the folded code: CAD, USD or UNK). Filter with
+    currency=["CAD"] or currency=["US$"]; spellings are interchangeable, which
+    matters because 549 orders are stored as 'US' rather than 'US$' and would
+    otherwise be missed. 16,969 orders have no currency recorded and come back
+    as UNK — do not assume those are either currency.
+
+    Charges are never converted between currencies. The exchange table in this
+    database has only 7 CAD-to-USD rates across 20 years, so any conversion
+    would be quietly wrong; compare like with like instead.
 
     Returns {"orders": [...], "count": n, "truncated": bool}. When truncated is
     true, more orders matched than were returned — narrow the filters or raise
@@ -484,6 +500,7 @@ def search_orders(
         origin_state=origin_state,
         dest_state=dest_state,
         min_charge=min_charge,
+        currency=currency,
         orders=orders,
         order_numbers=order_numbers,
     )
@@ -512,6 +529,7 @@ def summarize_orders(
     origin_state: list[str] | None = None,
     dest_state: list[str] | None = None,
     min_charge: float | None = None,
+    currency: list[str] | None = None,
     limit: int = 200,
 ) -> dict:
     """Aggregate orders into totals instead of listing them row by row.
@@ -519,12 +537,29 @@ def summarize_orders(
     Takes the same filters as search_orders plus a required group_by, one of:
     revtype1, revtype2, revtype3, revtype4, status, invoice_status, billto,
     shipper, consignee, origin_city, dest_city, origin_state, dest_state,
-    month, year.
+    month, year, currency.
 
     Each group returns order_count, total_charge, total_miles, total_weight,
     and rev_per_mile, sorted by total_charge descending. Prefer this over
     search_orders for any "how much / how many / which is biggest" question —
     it answers in a handful of rows what would otherwise take thousands.
+
+    EVERY GROUP IS SPLIT BY CURRENCY, because this database mixes Canadian and
+    US dollars and money is only additive within one currency. One logical
+    group therefore comes back as several rows — one per currency it contains
+    — each carrying its own `currency` (CAD, USD or UNK). Report a figure with
+    its currency, and never add two rows' totals together.
+
+    To see why: grouping 2024-onward orders by revtype1, the revtype 'EPT'
+    splits into 74.9M CAD, 6.4M USD and 11.0M with no currency recorded. Its
+    blended revenue per mile read 13.45, where the real figures are 13.45 CAD
+    per mile against 1.97 USD — a single number there was not a useful one.
+
+    Charges are not converted between currencies; the rates stored in this
+    database are too sparse in the CAD-to-USD direction to be trusted.
+
+    Pass group_by="currency" for the totals per currency directly, which is the
+    one case not split further.
     """
     return db.summarize_orders(
         group_by=group_by,
@@ -549,6 +584,7 @@ def summarize_orders(
         origin_state=origin_state,
         dest_state=dest_state,
         min_charge=min_charge,
+        currency=currency,
     )
 
 
@@ -635,6 +671,7 @@ def search_freight(
     dest_state: list[str] | None = None,
     origin_city: list[int] | None = None,
     dest_city: list[int] | None = None,
+    currency: list[str] | None = None,
     limit: int = 200,
 ) -> dict:
     """Search freight lines by commodity, weight, temperature, dimensions, and order.
@@ -728,6 +765,7 @@ def search_freight(
         dest_state=dest_state,
         origin_city=origin_city,
         dest_city=dest_city,
+        currency=currency,
     )
 
 class BearerAuthMiddleware:

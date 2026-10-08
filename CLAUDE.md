@@ -267,7 +267,7 @@ in `labelfile` under `InvoiceStatus` and `PayStatus`.
 | `search_stops` | `scope` + many optional filters | Stops by identity, status, date, appointment, location, driver, truck - see below |
 | `search_drivers` | `name` + many optional filters | Drivers by code, name, status, assignment, licence - see below |
 | `search_orders` | many optional filters | Orders by date, customer, location, revenue type — see below |
-| `summarize_orders` | `group_by` + same filters | Aggregated order totals instead of rows |
+| `summarize_orders` | `group_by` + same filters | Aggregated order totals instead of rows, split by currency |
 | `find_city_codes` | `name`, `state` | Resolve a city name to the numeric codes orders store |
 | `get_order_freight` | `orders`, `stop_type` | Freight lines per order; DRP (delivery) copies by default |
 | `summarize_order_freight` | `orders` | Per-order freight totals, with PUP vs DRP `in_sync` flag |
@@ -300,7 +300,7 @@ values were supplied. **Adding a searchable field is one line in that dict.**
 - Both tools fetch `limit + 1` rows and return `truncated` so the model can tell a
   partial answer from a complete one.
 - `summarize_orders` exists so aggregate questions don't pull thousands of rows into
-  context. `_ORDER_GROUPS` maps a `group_by` name to a key expression and an optional
+  context. Its groups are always split by currency — see below. `_ORDER_GROUPS` maps a `group_by` name to a key expression and an optional
   label expression (e.g. `billto` → id plus `cmp_name`).
 
 Filtering happens in SQL because `orderheader` is indexed for exactly these
@@ -469,6 +469,60 @@ tiebreaker which rows land inside `TOP` could vary between identical calls.
 
 Equivalence was verified against the three removed methods on an eight-order
 sample: all 31 rows identical, in the same order, on all three mappings.
+
+#### Currency
+
+**This is a mixed-currency database and `ord_totalcharge` is meaningless
+without `ord_currency` beside it.** The split:
+
+| Stored value | Orders | Folds to |
+|---|---|---|
+| `CA$` | 259,164 | CAD |
+| `US$` | 49,939 | USD |
+| `UNK` | 16,969 | UNK |
+| `US` | 549 | USD |
+| *(blank)* | 141 | UNK |
+| `CDN $` | 2 | CAD |
+
+So one currency is stored under two names in both directions, and there is no
+`Currency` row in `labelfile` to decode them. `_CURRENCY_NORM` folds the
+spellings in SQL, `_norm_currency` folds the caller's input the same way, and
+`search_orders` returns both: `currency` (the stored label) and
+`currency_code` (CAD / USD / UNK). A filter therefore accepts any spelling —
+`currency=["US$"]`, `["USD"]` and `["us"]` are the same query — which matters
+because the 549 rows spelled `US` would otherwise be missed by the obvious
+`US$`.
+
+**`summarize_orders` splits every group by currency**, and that was a bug fix,
+not a feature. Each `_ORDER_GROUPS` key spans several currencies here — all
+five of the busiest `revtype1` values mix three to five — so a single
+`SUM(ord_totalcharge)` per group was adding Canadian and US dollars together.
+Grouping 2024-onward orders by `revtype1`, `EPT` reported one total of
+**92,407,307**, which is really 74.96M CAD + 6.42M USD + 11.02M unrecorded.
+`rev_per_mile` was worse: the blended 13.45 hid 13.45 CAD/mi against 1.97
+USD/mi.
+
+The currency joins the `GROUP BY` rather than being summed wrong and then
+flagged, so each row is single-currency by construction. One logical group can
+come back as several rows, each carrying its own `currency`, and
+`split_by_currency` says so in the result. Grouping by `currency` itself is the
+one case not split further, since it would key on it twice. Verified: the split
+subtotals re-add exactly to the old mixed figures, so nothing was lost — only
+separated.
+
+**Charges are never converted.** There is a `currency_exchange` table
+(`cex_from_curr`, `cex_to_curr`, `cex_date`, `cex_rate`), but it is unusable in
+the direction that matters: `CA$`→`US$` has **7 rates across 20 years**, with
+gaps of 3,134, 2,375 and 1,126 days, so converting a 2017 order would apply a
+2013 rate. `US$`→`CA$` is dense by contrast (273 roughly monthly rows, some
+forward-dated to 2031), so converting everything *to* CAD would be feasible if
+it is ever wanted — but presenting a converted figure as authoritative when the
+rate is years stale is a worse failure than reporting two currencies
+separately.
+
+Note the 16,969 `UNK` orders are not a rounding error: they carry 13.1M in
+charges across the 2024-onward window alone. Do not assume they are either
+currency.
 
 ### Freight Detail
 

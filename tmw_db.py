@@ -11,6 +11,42 @@ import pyodbc
 #
 # "list" fragments take {ph} and expand to IN (?, ?, ...).
 
+# orderheader.ord_currency is not a clean code. This database holds CA$
+# (259,164 orders), US$ (49,939), UNK (16,969), a stray 'US' spelling (549),
+# 141 blanks and 2 rows of 'CDN $' - so 'US' and 'US$' are the same currency
+# under two names, as are 'CA$' and 'CDN $'. There is no Currency row in
+# labelfile to decode them. _CURRENCY_NORM folds the spellings together so a
+# total cannot be split across two names for one currency, and so a filter
+# accepts whichever spelling the caller happens to use.
+_CURRENCY_ALIASES = {
+    "CA$": "CAD", "CDN $": "CAD", "CDN$": "CAD", "CAD": "CAD", "CA": "CAD",
+    "US$": "USD", "US": "USD", "USD": "USD",
+}
+_CURRENCY_NORM = (
+    "(CASE LTRIM(RTRIM(COALESCE(oh.ord_currency, ''))) "
+    "WHEN 'CA$' THEN 'CAD' WHEN 'CDN $' THEN 'CAD' WHEN 'CDN$' THEN 'CAD' "
+    "WHEN 'US$' THEN 'USD' WHEN 'US' THEN 'USD' "
+    "WHEN '' THEN 'UNK' ELSE 'UNK' END)"
+)
+
+
+def _norm_currency(values):
+    """Map caller-supplied currency spellings onto the canonical codes.
+
+    Accepts 'CA$', 'CAD', 'US$', 'USD' and the rest interchangeably, so a
+    filter never misses the 549 rows spelled 'US' instead of 'US$'.
+    """
+    if values is None:
+        return None
+    if isinstance(values, str):
+        values = [values]
+    out = []
+    for v in values:
+        key = str(v).strip().upper()
+        out.append(_CURRENCY_ALIASES.get(key, key))
+    return list(dict.fromkeys(out))
+
+
 _ORDER_FILTERS: dict[str, tuple[str, str]] = {
     "orders":           ("oh.ord_hdrnumber IN ({ph})", "list"),
     "order_numbers":    ("oh.ord_number IN ({ph})", "list"),
@@ -34,6 +70,9 @@ _ORDER_FILTERS: dict[str, tuple[str, str]] = {
     "completed_after":  ("oh.ord_completiondate >= ?", "date"),
     "completed_before": ("oh.ord_completiondate < ?", "date"),
     "min_charge":       ("oh.ord_totalcharge >= ?", "scalar"),
+    # Compared against the folded code, so any spelling works; search_orders
+    # and summarize_orders put the supplied values through _norm_currency.
+    "currency":         (f"{_CURRENCY_NORM} IN ({{ph}})", "list"),
 }
 
 # group_by name -> (key expression, optional label expression)
@@ -53,6 +92,7 @@ _ORDER_GROUPS: dict[str, tuple[str, str | None]] = {
     "dest_state":     ("oh.ord_deststate", None),
     "month":          ("CONVERT(char(7), oh.ord_startdate, 126)", None),
     "year":           ("CONVERT(char(4), oh.ord_startdate, 126)", None),
+    "currency":       (_CURRENCY_NORM, None),
 }
 
 # --- Freight search ------------------------------------------------------
@@ -437,6 +477,13 @@ def _build_where(filters: dict, spec_table: dict | None = None) -> tuple[str, li
     table = _ORDER_FILTERS if spec_table is None else spec_table
     clauses: list[str] = []
     params: list = []
+
+    # The currency fragment compares against the folded code, so the caller's
+    # spelling has to be folded the same way. Done here rather than in each
+    # search, because every one of them inherits this filter and two of them
+    # silently returned nothing when it was not.
+    if filters.get("currency") is not None:
+        filters = {**filters, "currency": _norm_currency(filters["currency"])}
 
     for name, value in filters.items():
         if value is None:
@@ -1112,6 +1159,8 @@ class TmwDB:
                 oh.ord_totalmiles,
                 oh.ord_totalweight,
                 oh.ord_totalcharge,
+                oh.ord_currency,
+                {_CURRENCY_NORM},
                 oh.mov_number
             {_ORDER_FROM}
             WHERE {where}
@@ -1143,7 +1192,12 @@ class TmwDB:
                     "miles": row[16],
                     "weight": row[17],
                     "total_charge": row[18],
-                    "mov_number": row[19],
+                    # Both spellings: the stored label, and the folded code to
+                    # compare or group on. A charge means nothing without it -
+                    # this database is 84% CA$ and 16% US$.
+                    "currency": (row[19] or "").strip() or None,
+                    "currency_code": row[20],
+                    "mov_number": row[21],
                 }
                 for row in rows[:limit]
             ],
@@ -1152,6 +1206,13 @@ class TmwDB:
         }
 
     def summarize_orders(self, group_by: str, limit: int | None = None, **filters) -> dict:
+        """Aggregate order totals by one grouping key, split by currency.
+
+        The currency is always part of the group key (except when grouping by
+        currency itself, which would key on it twice), so a `total_charge` is
+        never a sum of mixed Canadian and US dollars. One logical group can
+        therefore come back as several rows, one per currency it contains.
+        """
         if not self.conn:
             self.connect()
 
@@ -1167,11 +1228,19 @@ class TmwDB:
         label_select = f"{label_expr} AS label," if label_expr else "NULL AS label,"
         group_cols = f"{key_expr}, {label_expr}" if label_expr else key_expr
 
+        # Money is only additive within one currency. Every _ORDER_GROUPS key
+        # spans several here - the five busiest revtype1 values mix 3 to 5 -
+        # so the currency is part of the key and each total is unambiguous.
+        # Grouping by currency alone would otherwise key on it twice.
+        if group_by != "currency":
+            group_cols = f"{group_cols}, {_CURRENCY_NORM}"
+
         cursor = self.conn.cursor()
         cursor.execute(f"""
             SELECT TOP (?)
                 {key_expr} AS grp,
                 {label_select}
+                {_CURRENCY_NORM} AS currency,
                 COUNT(*) AS order_count,
                 SUM(oh.ord_totalcharge) AS total_charge,
                 SUM(oh.ord_totalmiles) AS total_miles,
@@ -1188,15 +1257,19 @@ class TmwDB:
 
         return {
             "group_by": group_by,
+            "split_by_currency": group_by != "currency",
             "groups": [
                 {
                     "group": row[0],
                     "label": row[1],
-                    "order_count": row[2],
-                    "total_charge": row[3],
-                    "total_miles": row[4],
-                    "total_weight": row[5],
-                    "rev_per_mile": round(row[6], 3) or 0.0 if row[6] is not None else None,
+                    # Every money figure on this row is in this currency, and
+                    # rows for the same group in another currency are separate.
+                    "currency": row[2],
+                    "order_count": row[3],
+                    "total_charge": row[4],
+                    "total_miles": row[5],
+                    "total_weight": row[6],
+                    "rev_per_mile": round(row[7], 3) or 0.0 if row[7] is not None else None,
                 }
                 for row in rows[:limit]
             ],

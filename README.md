@@ -299,11 +299,25 @@ compose.yml.example     Container config template (copy to compose.yml)
 | `search_stops` | `scope` + many optional filters | Stops by identity, status, date, appointment, location, driver, truck |
 | `search_drivers` | `name` + many optional filters | Drivers by code, name, status, assignment, licence |
 | `search_orders` | many optional filters | Orders by date, customer, location, revenue type |
-| `summarize_orders` | `group_by` + same filters | Aggregated order totals instead of rows |
+| `summarize_orders` | `group_by` + same filters | Aggregated order totals, split by currency |
 | `find_city_codes` | `name`, `state` | Resolve a city name to the numeric codes orders store |
 | `get_order_freight` | `orders`, `stop_type` | Freight lines per order; DRP (delivery) copies by default |
 | `summarize_order_freight` | `orders` | Per-order freight totals, with PUP vs DRP `in_sync` flag |
 | `search_freight` | freight + order filters | Freight by commodity, weight, temperature, dimensions |
+
+**Charges carry a currency.** 84% of orders in this database are Canadian
+dollars and 16% US, so `search_orders` returns `currency` (the stored label,
+e.g. `CA$`) and `currency_code` (`CAD`, `USD` or `UNK`) next to
+`total_charge`. Filter with `currency=["CAD"]` or `currency=["US$"]` —
+spellings are interchangeable, which matters because some orders are stored as
+`US` rather than `US$`.
+
+`summarize_orders` splits every group by currency for the same reason: money is
+only additive within one currency. One logical group comes back as several
+rows, each with its own `currency`, so report a total with its currency and
+never add two rows together. Group by `currency` to get the per-currency
+figures directly. Charges are not converted between currencies — the stored
+exchange rates are too sparse in the CAD-to-USD direction to trust.
 
 `search_drivers` looks up the 676-row driver table by code or by name. Because
 the table is small, `name` is a substring search and word order does not
