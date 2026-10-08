@@ -204,6 +204,109 @@ _ORDER_FROM = """
 """
 
 
+# --- Stop search ----------------------------------------------------------
+#
+# One query serves every stop lookup, the way _ORDER_FILTERS serves order
+# search. Filtering in SQL is right here for the same reason: `stops` is
+# indexed for almost exactly these predicates - sk_stp_ordnum (ord_hdrnumber),
+# dk_lghnum (lgh_number), dk_mov (mov_number), dk_stp_type, sk_stp_arrvdt
+# (stp_arrivaldate), dk_stops_sch_seq (stp_schdtearliest), dk_stpdetstatus
+# (stp_status + stp_departure_status), dk_cmparrival (cmp_id), ix_stp_city,
+# sk_stops_stp_refnum (stp_reftype + stp_refnum), ix_stops_HLT (stp_event) -
+# and on legheader dk_lgh_driver1, ix_lh_dr2_outst_stdt, dk_tractor and
+# dk_lgh_carrier_enddate cover the people and equipment filters.
+#
+# Two exceptions, both deliberate:
+#   - `trailers` reads stops.trl_id, which carries no index, so it scans 1.6M
+#     rows alone. Pair it with a date or status filter.
+#   - `late_arrival` compares two columns, so no index can serve it. Same advice.
+_STOP_FILTERS: dict[str, tuple[str, str]] = {
+    # Identity
+    "stops":             ("s.stp_number IN ({ph})", "list"),
+    "orders":            ("s.ord_hdrnumber IN ({ph})", "list"),
+    "legs":              ("s.lgh_number IN ({ph})", "list"),
+    "movements":         ("s.mov_number IN ({ph})", "list"),
+    # Classification
+    "stop_types":        ("s.stp_type IN ({ph})", "list"),
+    "events":            ("s.stp_event IN ({ph})", "list"),
+    # Progress. Named stop_status / departure_status because plain `status` and
+    # `invoice_status` are the ORDER's, inherited from _ORDER_FILTERS.
+    "stop_status":       ("s.stp_status IN ({ph})", "list"),
+    "departure_status":  ("s.stp_departure_status IN ({ph})", "list"),
+    "unarrived":         ("s.stp_status <> 'DNE'", "flag"),
+    "undeparted":        ("s.stp_departure_status <> 'DNE'", "flag"),
+    # Actual times. These are expected times until the driver has been there,
+    # so a date range spans planned and historical stops alike.
+    "arrived_after":     ("s.stp_arrivaldate >= ?", "date"),
+    "arrived_before":    ("s.stp_arrivaldate < ?", "date"),
+    "departed_after":    ("s.stp_departuredate >= ?", "date"),
+    "departed_before":   ("s.stp_departuredate < ?", "date"),
+    # Appointment window
+    "appt_after":        ("s.stp_schdtearliest >= ?", "date"),
+    "appt_before":       ("s.stp_schdtearliest < ?", "date"),
+    "appt_latest_after": ("s.stp_schdtlatest >= ?", "date"),
+    "appt_latest_before": ("s.stp_schdtlatest < ?", "date"),
+    "firm_appt":         ("s.stp_firm_appt_flag = 'Y'", "flag"),
+    "late_arrival":      ("s.stp_arrivaldate > s.stp_schdtlatest", "flag"),
+    # Where
+    "companies":         ("s.cmp_id IN ({ph})", "list"),
+    "cities":            ("s.stp_city IN ({ph})", "list"),
+    "states":            ("s.stp_state IN ({ph})", "list"),
+    "zips":              ("s.stp_zipcode IN ({ph})", "list"),
+    # Who and what pulled it. `drivers` matches either seat, which is what
+    # "this driver's stops" means to a dispatcher. Written as two seeks UNIONed
+    # rather than `lgh_driver1 IN (..) OR lgh_driver2 IN (..)`: the OR form
+    # cannot use dk_lgh_driver1 and ix_lh_dr2_outst_stdt at once and scanned
+    # legheader for 3.1s, where this returns in milliseconds.
+    "drivers":           (
+        "s.lgh_number IN ("
+        " SELECT d1.lgh_number FROM legheader d1 WHERE d1.lgh_driver1 IN ({ph})"
+        " UNION"
+        " SELECT d2.lgh_number FROM legheader d2 WHERE d2.lgh_driver2 IN ({ph}))",
+        "list_x2",
+    ),
+    "trucks":            ("lh.lgh_tractor IN ({ph})", "list"),
+    "carriers":          ("lh.lgh_carrier IN ({ph})", "list"),
+    "trailers":          ("s.trl_id IN ({ph})", "list"),
+    # Customer paperwork: B/L #, LOAD #, P/U #, REF, CUSBRK are the common types
+    "reference_numbers": ("s.stp_refnum IN ({ph})", "list"),
+    "reference_types":   ("s.stp_reftype IN ({ph})", "list"),
+}
+
+# Narrow FROM for the key-picking half of the deferred join: only the tables a
+# filter can reference. The output columns are joined on afterwards.
+_STOP_FILTER_FROM = """
+    FROM stops s
+    LEFT JOIN legheader lh   ON lh.lgh_number = s.lgh_number
+    LEFT JOIN orderheader oh ON oh.ord_hdrnumber = s.ord_hdrnumber
+"""
+
+# Wide FROM for the output half. `s` is joined by the caller against the
+# picked key set, so this lists only the decoration.
+_STOP_OUTPUT_JOINS = """
+    LEFT JOIN legheader lh       ON lh.lgh_number = s.lgh_number
+    LEFT JOIN orderheader oh     ON oh.ord_hdrnumber = s.ord_hdrnumber
+    LEFT JOIN company c          ON c.cmp_id = s.cmp_id
+    LEFT JOIN city cty           ON cty.cty_code = s.stp_city
+    LEFT JOIN eventcodetable ect ON ect.abbr = s.stp_event
+    LEFT JOIN labelfile lf       ON lf.abbr = s.stp_type3
+        AND lf.labeldefinition = 'StpType3'
+"""
+
+# Trip order: movements oldest-first by their earliest arrival, then
+# chronological within each. stp_number is the tiebreaker - stops in a leg can
+# share an arrival date, and without it which rows land inside TOP could vary
+# between identical calls.
+_STOP_ORDER = """
+    ORDER BY
+        MIN(s.stp_arrivaldate) OVER (PARTITION BY s.mov_number),
+        s.mov_number,
+        s.lgh_number,
+        s.stp_arrivaldate,
+        s.stp_number
+"""
+
+
 def _coerce_date(value):
     if isinstance(value, datetime):
         return value
@@ -218,8 +321,9 @@ def _coerce_date(value):
 def _build_where(filters: dict, spec_table: dict | None = None) -> tuple[str, list]:
     """Turn a dict of filters into a WHERE clause and its parameters.
 
-    `spec_table` defaults to the order filters; freight searches pass the merged
-    freight + order table so one assembler serves both.
+    `spec_table` defaults to the order filters; freight and stop searches pass
+    their own table merged with the order one, so a single assembler serves all
+    three and an order filter such as billto composes with any of them.
 
     Unknown filter names raise rather than being silently ignored, so a
     mistyped filter can never widen the result set.
@@ -237,12 +341,16 @@ def _build_where(filters: dict, spec_table: dict | None = None) -> tuple[str, li
             raise ValueError(f"Unknown filter {name!r}. Valid filters: {valid}")
         fragment, kind = spec
 
-        if kind == "list":
+        if kind in ("list", "list_x2"):
             values = [value] if isinstance(value, (str, int)) else list(value)
             if not values:
                 continue
+            # str.format fills every {ph} in the fragment, so a two-column OR
+            # needs its values bound twice over.
             clauses.append(fragment.format(ph=", ".join("?" * len(values))))
             params.extend(values)
+            if kind == "list_x2":
+                params.extend(values)
         elif kind == "flag":
             # Only a true value applies the predicate; false means "don't care".
             if value:
@@ -257,7 +365,9 @@ def _build_where(filters: dict, spec_table: dict | None = None) -> tuple[str, li
     if not clauses:
         raise ValueError(
             "At least one filter is required — an unfiltered search would scan "
-            "every order in the system."
+            "every row in the table. If you did pass one, check its spelling "
+            "against the tool's parameters: an unrecognised name is dropped by "
+            "the schema before it reaches this check."
         )
     return " AND ".join(clauses), params
 
@@ -350,25 +460,36 @@ class TmwDB:
 
     def _stop_row_to_dict(self, row) -> dict:
         return {
-            "mov_number": row[0],
-            "lgh_number": row[1],
-            "ord_hdrnumber": row[2],
-            "stp_event": row[3],
-            "stp_event_name": row[4],
-            "stp_status": row[5],
-            "stp_departure_status": row[6],
-            "arrival_date": str(row[7]) if row[7] else None,
-            "departure_date": str(row[8]) if row[8] else None,
-            "appt_earliest": str(row[9]) if row[9] else None,
-            "appt_latest": str(row[10]) if row[10] else None,
-            "driver": row[11],
-            "truck": row[12],
-            "carrier": row[13],
-            "trailer": row[14],
-            "cmp_id": row[15],
-            "address": row[16],
-            "city_state": row[17],
-            "appt_type": row[18],
+            "stp_number": row[0],
+            "mov_number": row[1],
+            "lgh_number": row[2],
+            "ord_hdrnumber": row[3],
+            "ord_number": row[4].strip() if row[4] else None,
+            "order_status": row[5],
+            "stp_type": row[6],
+            "stp_event": row[7],
+            "stp_event_name": row[8],
+            "stp_status": row[9],
+            "stp_departure_status": row[10],
+            "arrival_date": str(row[11]) if row[11] else None,
+            "departure_date": str(row[12]) if row[12] else None,
+            "appt_earliest": str(row[13]) if row[13] else None,
+            "appt_latest": str(row[14]) if row[14] else None,
+            "driver": row[15],
+            "codriver": row[16],
+            "truck": row[17],
+            "carrier": row[18],
+            "trailer": row[19].strip() if row[19] else None,
+            "cmp_id": row[20],
+            "cmp_name": row[21],
+            "address": row[22],
+            "city_state": row[23],
+            "state": row[24],
+            "zip": row[25],
+            "appt_type": row[26],
+            "sequence": row[27],
+            "reference_type": row[28],
+            "reference_number": row[29].strip() if row[29] else None,
         }
 
     def _fetch_all_objects(self, cursor, cls):
@@ -456,149 +577,145 @@ class TmwDB:
             for row in cursor.fetchall()
         ]
 
-    def get_order_stops(self, order_ids: list[str]) -> list[dict]:
-        if not order_ids:
-            return []
+    _STOP_SELECT = """
+        s.stp_number,
+        s.mov_number,
+        s.lgh_number,
+        s.ord_hdrnumber,
+        oh.ord_number,
+        oh.ord_status,
+        s.stp_type,
+        s.stp_event,
+        ect.name AS StpEventName,
+        s.stp_status,
+        s.stp_departure_status,
+        s.stp_arrivaldate,
+        s.stp_departuredate,
+        s.stp_schdtearliest AS AppointmentEarliest,
+        s.stp_schdtlatest AS AppointmentLatest,
+        lh.lgh_driver1,
+        lh.lgh_driver2,
+        lh.lgh_tractor,
+        lh.lgh_carrier,
+        s.trl_id,
+        s.cmp_id,
+        c.cmp_name,
+        c.cmp_address1,
+        cty.cty_nmstct,
+        s.stp_state,
+        s.stp_zipcode,
+        lf.name AS Appt,
+        s.stp_sequence,
+        s.stp_reftype,
+        s.stp_refnum
+    """
 
+    def search_stops(
+        self,
+        scope: str = "stop",
+        limit: int | None = None,
+        **filters,
+    ) -> dict:
+        """Search stops by any indexed field, optionally widening to whole trips.
+
+        `scope` decides what the matched stops stand for, and it matters:
+
+        - "stop" returns the matching stops themselves. `limit` bounds rows.
+        - "movement" returns every stop on every movement a match belongs to,
+          which is the Trip Folder view. `limit` bounds MOVEMENTS, not rows.
+
+        The distinction is not cosmetic. 267,192 of 344,345 movements in this
+        database carry stops from more than one order, so for roughly three
+        orders in four, scope="movement" returns stops the order does not own -
+        the co-loaded freight that shares the trailer. Asking for order 373 with
+        scope="stop" yields its 2 stops; with scope="movement" it yields 7.
+        Neither is wrong, but only one answers "what else is on this truck".
+
+        Movement scope also surfaces stops with ord_hdrnumber = 0, which is not
+        an order - there is no row 0 in orderheader. Those 790k stops are empty
+        equipment events (BMT, DMT, DLT, HLT, RTP) on the empty legs a movement
+        can carry at either end, so they are real trip context, and ord_number
+        and order_status come back NULL for them.
+        """
         if not self.conn:
             self.connect()
 
-        placeholders = ", ".join("?" * len(order_ids))
+        scope = (scope or "stop").lower()
+        if scope not in ("stop", "movement"):
+            raise ValueError(f"scope must be 'stop' or 'movement', got {scope!r}")
+
+        limit = min(limit or self.max_search_rows, self.max_search_rows)
+        # Stop filters win on `orders`: s.ord_hdrnumber seeks sk_stp_ordnum
+        # directly, where oh.ord_hdrnumber would go through the join. Every
+        # other name is distinct, so order filters such as billto, revtype1 or
+        # started_after compose freely with stop filters.
+        merged = {**_ORDER_FILTERS, **_STOP_FILTERS}
+        where, params = _build_where(filters, merged)
+
         cursor = self.conn.cursor()
+
+        if scope == "movement":
+            # Pick the distinct movements the filters hit, then widen. Fan-out
+            # is bounded in practice: 4.8 stops per movement on average, 84 at
+            # the worst, and only 199 movements exceed 20.
+            cursor.execute(f"""
+                WITH matched AS (
+                    SELECT DISTINCT TOP (?) s.mov_number
+                    {_STOP_FILTER_FROM}
+                    WHERE {where}
+                    ORDER BY s.mov_number DESC
+                )
+                SELECT {self._STOP_SELECT}
+                FROM matched
+                JOIN stops s ON s.mov_number = matched.mov_number
+                {_STOP_OUTPUT_JOINS}
+                {_STOP_ORDER}
+            """, [limit + 1, *params])
+            rows = cursor.fetchall()
+            movements = {r[1] for r in rows}
+            truncated = len(movements) > limit
+            if truncated:
+                # Drop the overflow movement whole rather than truncating it
+                # mid-trip, which would look like a short trip.
+                keep = set(sorted(movements, reverse=True)[:limit])
+                rows = [r for r in rows if r[1] in keep]
+                movements = keep
+            return {
+                "stops": [self._stop_row_to_dict(r) for r in rows],
+                "count": len(rows),
+                "movements": len(movements),
+                "truncated": truncated,
+                "scope": scope,
+            }
+
+        # Deferred join, for the same reason search_freight uses one: the 30
+        # output columns across six tables in the same query as the TOP/ORDER BY
+        # cost the optimiser the ordered scan the row goal allows. Picking
+        # stp_number first, then widening over at most `limit` rows, keeps it.
+        # Selection takes the most recent matches; presentation is trip order.
         cursor.execute(f"""
-            SELECT
-                s.mov_number,
-                s.lgh_number,
-                s.ord_hdrnumber,
-                s.stp_event,
-                ect.name AS StpEventName,
-                s.stp_status,
-                s.stp_departure_status,
-                s.stp_arrivaldate,
-                s.stp_departuredate,
-                s.stp_schdtearliest AS AppointmentEarliest,
-                s.stp_schdtlatest AS AppointmentLatest,
-                lh.lgh_driver1,
-                lh.lgh_tractor,
-                lh.lgh_carrier,
-                s.trl_id,
-                s.cmp_id,
-                c.cmp_address1,
-                cty.cty_nmstct,
-                lf.name AS Appt
-            FROM stops s
-            LEFT JOIN legheader lh ON lh.lgh_number = s.lgh_number
-            LEFT JOIN company c ON c.cmp_id = s.cmp_id
-            LEFT JOIN labelfile lf ON lf.abbr = s.stp_type3
-                AND lf.labeldefinition = 'StpType3'
-            LEFT JOIN city cty ON cty.cty_code = s.stp_city
-            LEFT JOIN eventcodetable ect ON ect.abbr = s.stp_event
-            WHERE s.mov_number IN (
-                SELECT DISTINCT mov_number FROM stops ss
-                WHERE ss.ord_hdrnumber IN ({placeholders})
+            WITH picked AS (
+                SELECT TOP (?) s.stp_number
+                {_STOP_FILTER_FROM}
+                WHERE {where}
+                ORDER BY s.stp_arrivaldate DESC, s.stp_number DESC
             )
-            ORDER BY
-                MIN(s.stp_arrivaldate) OVER (PARTITION BY s.mov_number),
-                s.mov_number,
-                s.lgh_number,
-                s.stp_arrivaldate
-        """, order_ids)
+            SELECT {self._STOP_SELECT}
+            FROM picked
+            JOIN stops s ON s.stp_number = picked.stp_number
+            {_STOP_OUTPUT_JOINS}
+            {_STOP_ORDER}
+        """, [limit + 1, *params])
 
-        return [self._stop_row_to_dict(row) for row in cursor.fetchall()]
-
-    def get_leg_stops(self, leg_ids: list[str]) -> list[dict]:
-        if not leg_ids:
-            return []
-
-        if not self.conn:
-            self.connect()
-
-        placeholders = ", ".join("?" * len(leg_ids))
-        cursor = self.conn.cursor()
-        cursor.execute(f"""
-            SELECT
-                s.mov_number,
-                s.lgh_number,
-                s.ord_hdrnumber,
-                s.stp_event,
-                ect.name AS StpEventName,
-                s.stp_status,
-                s.stp_departure_status,
-                s.stp_arrivaldate,
-                s.stp_departuredate,
-                s.stp_schdtearliest AS AppointmentEarliest,
-                s.stp_schdtlatest AS AppointmentLatest,
-                lh.lgh_driver1,
-                lh.lgh_tractor,
-                lh.lgh_carrier,
-                s.trl_id,
-                s.cmp_id,
-                c.cmp_address1,
-                cty.cty_nmstct,
-                lf.name AS Appt
-            FROM stops s
-            LEFT JOIN legheader lh ON lh.lgh_number = s.lgh_number
-            LEFT JOIN company c ON c.cmp_id = s.cmp_id
-            LEFT JOIN labelfile lf ON lf.abbr = s.stp_type3
-                AND lf.labeldefinition = 'StpType3'
-            LEFT JOIN city cty ON cty.cty_code = s.stp_city
-            LEFT JOIN eventcodetable ect ON ect.abbr = s.stp_event
-            WHERE s.lgh_number IN ({placeholders})
-            ORDER BY
-                MIN(s.stp_arrivaldate) OVER (PARTITION BY s.mov_number),
-                s.mov_number,
-                s.lgh_number,
-                s.stp_arrivaldate
-        """, leg_ids)
-
-        return [self._stop_row_to_dict(row) for row in cursor.fetchall()]
-
-    def get_movement_stops(self, mov_ids: list[str]) -> list[dict]:
-        if not mov_ids:
-            return []
-
-        if not self.conn:
-            self.connect()
-
-        placeholders = ", ".join("?" * len(mov_ids))
-        cursor = self.conn.cursor()
-        cursor.execute(f"""
-            SELECT
-                s.mov_number,
-                s.lgh_number,
-                s.ord_hdrnumber,
-                s.stp_event,
-                ect.name AS StpEventName,
-                s.stp_status,
-                s.stp_departure_status,
-                s.stp_arrivaldate,
-                s.stp_departuredate,
-                s.stp_schdtearliest AS AppointmentEarliest,
-                s.stp_schdtlatest AS AppointmentLatest,
-                lh.lgh_driver1,
-                lh.lgh_tractor,
-                lh.lgh_carrier,
-                s.trl_id,
-                s.cmp_id,
-                c.cmp_address1,
-                cty.cty_nmstct,
-                lf.name AS Appt
-            FROM stops s
-            LEFT JOIN legheader lh ON lh.lgh_number = s.lgh_number
-            LEFT JOIN company c ON c.cmp_id = s.cmp_id
-            LEFT JOIN labelfile lf ON lf.abbr = s.stp_type3
-                AND lf.labeldefinition = 'StpType3'
-            LEFT JOIN city cty ON cty.cty_code = s.stp_city
-            LEFT JOIN eventcodetable ect ON ect.abbr = s.stp_event
-            WHERE s.mov_number IN ({placeholders})
-            ORDER BY
-                MIN(s.stp_arrivaldate) OVER (PARTITION BY s.mov_number),
-                s.mov_number,
-                s.lgh_number,
-                s.stp_arrivaldate
-        """, mov_ids)
-
-        return [self._stop_row_to_dict(row) for row in cursor.fetchall()]
+        rows = cursor.fetchall()
+        truncated = len(rows) > limit
+        return {
+            "stops": [self._stop_row_to_dict(r) for r in rows[:limit]],
+            "count": min(len(rows), limit),
+            "movements": len({r[1] for r in rows[:limit]}),
+            "truncated": truncated,
+            "scope": scope,
+        }
 
     def get_active_power(self) -> list[dict]:
         if not self.conn:

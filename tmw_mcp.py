@@ -117,23 +117,181 @@ def get_active_legs() -> list[dict]:
 
 
 @mcp.tool()
-def get_leg_stops(legs: list[str]) -> list[dict]:
-    """Get all stops for one or more legs (lgh_number)."""
-    return db.get_leg_stops(legs)
+def search_stops(
+    scope: str = "stop",
+    orders: list[int] | None = None,
+    legs: list[int] | None = None,
+    movements: list[int] | None = None,
+    stops: list[int] | None = None,
+    stop_types: list[str] | None = None,
+    events: list[str] | None = None,
+    stop_status: list[str] | None = None,
+    departure_status: list[str] | None = None,
+    unarrived: bool = False,
+    undeparted: bool = False,
+    arrived_after: str | None = None,
+    arrived_before: str | None = None,
+    departed_after: str | None = None,
+    departed_before: str | None = None,
+    appt_after: str | None = None,
+    appt_before: str | None = None,
+    appt_latest_after: str | None = None,
+    appt_latest_before: str | None = None,
+    firm_appt: bool = False,
+    late_arrival: bool = False,
+    companies: list[str] | None = None,
+    cities: list[int] | None = None,
+    states: list[str] | None = None,
+    zips: list[str] | None = None,
+    drivers: list[str] | None = None,
+    trucks: list[str] | None = None,
+    carriers: list[str] | None = None,
+    trailers: list[str] | None = None,
+    reference_numbers: list[str] | None = None,
+    reference_types: list[str] | None = None,
+    billto: list[str] | None = None,
+    shipper: list[str] | None = None,
+    consignee: list[str] | None = None,
+    status: list[str] | None = None,
+    invoice_status: list[str] | None = None,
+    revtype1: list[str] | None = None,
+    revtype2: list[str] | None = None,
+    revtype3: list[str] | None = None,
+    revtype4: list[str] | None = None,
+    started_after: str | None = None,
+    started_before: str | None = None,
+    completed_after: str | None = None,
+    completed_before: str | None = None,
+    order_numbers: list[str] | None = None,
+    origin_company: list[str] | None = None,
+    dest_company: list[str] | None = None,
+    origin_city: list[int] | None = None,
+    dest_city: list[int] | None = None,
+    origin_state: list[str] | None = None,
+    dest_state: list[str] | None = None,
+    min_charge: float | None = None,
+    limit: int = 200,
+) -> dict:
+    """Search stops by identity, status, date, appointment, location, driver, or truck.
 
+    At least one filter is required. Dates are ISO strings ('2025-06-01') and the
+    *_before bounds are exclusive. All list filters match any of the given values.
 
-@mcp.tool()
-def get_movement_stops(movements: list[str]) -> list[dict]:
-    """Get all stops across all legs within one or more movements (mov_number)."""
-    return db.get_movement_stops(movements)
+    SCOPE decides what the matches stand for, and choosing wrong quietly changes
+    the answer:
 
+    - scope="stop" (default) returns the matching stops themselves, newest first.
+      limit bounds the number of stops.
+    - scope="movement" returns EVERY stop on every movement a match belongs to -
+      the whole trip, the Trip Folder view. limit bounds MOVEMENTS, not rows.
 
-@mcp.tool()
-def get_order_stops(orders: list[str]) -> list[dict]:
-    """Get all stops across every movement and leg associated with one or more orders.
-    Returns the full stop sequence including all movements an order is part of, not just direct stops.
+    Three quarters of movements in this database carry stops from more than one
+    order, so scope="movement" normally returns stops belonging to other orders
+    too: the co-loaded freight sharing the trailer. Use it to answer "what else
+    is on this truck" or "show me the whole trip". Use scope="stop" to answer
+    "which stops match these conditions".
+
+    The three lookups this replaces:
+      every stop on an order's trips -> search_stops(orders=[...], scope="movement")
+      stops on specific legs         -> search_stops(legs=[...])
+      stops in specific movements    -> search_stops(movements=[...])
+
+    STOP vs ORDER fields. stop_status and departure_status are the stop's; plain
+    status and invoice_status are the ORDER's, as are billto, shipper, consignee,
+    revtype1-4 and started_after/before, so you can ask for stops on a customer's
+    orders without a second query. stop_status is DNE (arrived), NON or OPN;
+    departure_status DNE means the driver has left. unarrived and undeparted are
+    the shorthands for "not there yet" and "still there".
+
+    stop_types are PUP (pickup), DRP (delivery) and NONE (an in-transit copy on a
+    DLT/HLT/BMT stop - most rows, rarely what you want). events are the finer
+    codes: LUL, DLT, HLT, XDU, XDL and so on.
+
+    DATES. arrival_date and departure_date hold actual times once the driver has
+    been there and expected times before, so one date range spans history and
+    plan. appt_after/appt_before bound the earliest appointment time
+    (stp_schdtearliest); appt_latest_* bound the late end of the window.
+    late_arrival=True keeps only stops that arrived after their window closed.
+
+    cities are numeric city codes from find_city_codes, not names. states are
+    two-letter. companies are cmp_id facility codes. These describe where THIS
+    STOP is; origin_city / dest_state / origin_company and the rest describe the
+    ORDER's endpoints, so stops=TX with origin_state=IL finds the Texas stops of
+    loads that started in Illinois.
+
+    drivers matches either seat, so a team driver's stops are found whichever
+    seat they held. reference_numbers searches customer paperwork - pair it with
+    reference_types, where the common types are 'B/L #', 'LOAD #', 'P/U #',
+    'REF' and 'CUSBRK'.
+
+    Two filters cannot use an index and scan 1.6M rows if used alone - trailers
+    and late_arrival. Pair either with a date or status filter.
+
+    Stops with ord_hdrnumber 0 are not an order: they are empty equipment moves
+    (BMT, DMT, DLT, HLT, RTP) on a movement's empty legs, and scope="movement"
+    includes them as trip context with ord_number and order_status NULL.
+
+    Returns {"stops": [...], "count": n, "movements": n, "truncated": bool,
+    "scope": str}, ordered by trip: movements by their first arrival, then
+    chronologically within each. When truncated is true more matched than were
+    returned - narrow the filters or raise limit rather than treating the result
+    as complete.
     """
-    return db.get_order_stops(orders)
+    return db.search_stops(
+        scope=scope,
+        limit=limit,
+        orders=orders,
+        legs=legs,
+        movements=movements,
+        stops=stops,
+        stop_types=stop_types,
+        events=events,
+        stop_status=stop_status,
+        departure_status=departure_status,
+        unarrived=unarrived,
+        undeparted=undeparted,
+        arrived_after=arrived_after,
+        arrived_before=arrived_before,
+        departed_after=departed_after,
+        departed_before=departed_before,
+        appt_after=appt_after,
+        appt_before=appt_before,
+        appt_latest_after=appt_latest_after,
+        appt_latest_before=appt_latest_before,
+        firm_appt=firm_appt,
+        late_arrival=late_arrival,
+        companies=companies,
+        cities=cities,
+        states=states,
+        zips=zips,
+        drivers=drivers,
+        trucks=trucks,
+        carriers=carriers,
+        trailers=trailers,
+        reference_numbers=reference_numbers,
+        reference_types=reference_types,
+        billto=billto,
+        shipper=shipper,
+        consignee=consignee,
+        status=status,
+        invoice_status=invoice_status,
+        revtype1=revtype1,
+        revtype2=revtype2,
+        revtype3=revtype3,
+        revtype4=revtype4,
+        started_after=started_after,
+        started_before=started_before,
+        completed_after=completed_after,
+        completed_before=completed_before,
+        order_numbers=order_numbers,
+        origin_company=origin_company,
+        dest_company=dest_company,
+        origin_city=origin_city,
+        dest_city=dest_city,
+        origin_state=origin_state,
+        dest_state=dest_state,
+        min_charge=min_charge,
+    )
 
 
 @mcp.tool()

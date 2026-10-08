@@ -296,15 +296,36 @@ compose.yml.example     Container config template (copy to compose.yml)
 | `truck_plan` | `trucks: list[str]` | Active (PLN/STD) stop sequences per truck |
 | `get_active_power` | _(none)_ | Active tractors with current driver and team leader |
 | `get_active_legs` | _(none)_ | All active legs (AVL/PLN/STD) fleet-wide |
-| `get_leg_stops` | `legs: list[str]` | All stops for the given legs |
-| `get_movement_stops` | `movements: list[str]` | All stops across all legs in the given movements |
-| `get_order_stops` | `orders: list[str]` | All stops across every movement an order touches |
+| `search_stops` | `scope` + many optional filters | Stops by identity, status, date, appointment, location, driver, truck |
 | `search_orders` | many optional filters | Orders by date, customer, location, revenue type |
 | `summarize_orders` | `group_by` + same filters | Aggregated order totals instead of rows |
 | `find_city_codes` | `name`, `state` | Resolve a city name to the numeric codes orders store |
 | `get_order_freight` | `orders`, `stop_type` | Freight lines per order; DRP (delivery) copies by default |
 | `summarize_order_freight` | `orders` | Per-order freight totals, with PUP vs DRP `in_sync` flag |
 | `search_freight` | freight + order filters | Freight by commodity, weight, temperature, dimensions |
+
+`search_stops` answers every stop question through one query. Filters cover
+identity (`orders`, `legs`, `movements`, `stops`), classification
+(`stop_types` PUP/DRP/NONE, `events`), progress (`stop_status`,
+`departure_status`, `unarrived`, `undeparted`), actual times
+(`arrived_after`/`before`, `departed_after`/`before`), the appointment window
+(`appt_after`/`before`, `appt_latest_after`/`before`, `firm_appt`,
+`late_arrival`), place (`companies`, `cities`, `states`, `zips`), people and
+equipment (`drivers`, `trucks`, `carriers`, `trailers`) and customer paperwork
+(`reference_numbers` with `reference_types` such as `B/L #` or `LOAD #`). Every
+`search_orders` filter works here too, so "stops in Texas on that customer's
+loads" is a single call.
+
+`scope` is the argument to get right. `scope="stop"` returns the matching stops;
+`scope="movement"` returns every stop on their movements — the Trip Folder view
+— and `limit` then counts movements rather than rows. Three quarters of
+movements carry more than one order, so movement scope normally includes
+co-loaded freight sharing the trailer. The three tools this replaced map to
+`search_stops(orders=[...], scope="movement")`, `search_stops(legs=[...])` and
+`search_stops(movements=[...])`.
+
+`drivers` matches either seat. `trailers` and `late_arrival` cannot use an
+index, so pair them with a date or status filter.
 
 `search_orders` and `summarize_orders` share one filter set: date ranges,
 `billto`, `shipper`, `consignee`, `status`, `invoice_status`, `revtype1`-`4`,

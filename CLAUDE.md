@@ -264,9 +264,7 @@ in `labelfile` under `InvoiceStatus` and `PayStatus`.
 | `truck_plan` | `trucks: list[str]` | Active (PLN/STD) stop sequences for trucks, sorted by truck then trip order |
 | `get_active_power` | _(none)_ | All active tractors with current driver and team leader |
 | `get_active_legs` | _(none)_ | All active legs (AVL/PLN/STD) fleet-wide — can be large, filter in Python |
-| `get_leg_stops` | `legs: list[str]` | All stops for given leg numbers |
-| `get_movement_stops` | `movements: list[str]` | All stops across all legs within given movements |
-| `get_order_stops` | `orders: list[str]` | All stops across every movement an order is part of |
+| `search_stops` | `scope` + many optional filters | Stops by identity, status, date, appointment, location, driver, truck - see below |
 | `search_orders` | many optional filters | Orders by date, customer, location, revenue type — see below |
 | `summarize_orders` | `group_by` + same filters | Aggregated order totals instead of rows |
 | `find_city_codes` | `name`, `state` | Resolve a city name to the numeric codes orders store |
@@ -280,7 +278,7 @@ in `labelfile` under `InvoiceStatus` and `PayStatus`.
 
 - All multi-value filters use parameterized `IN (?, ?, ...)` placeholders — never string interpolation for user values
 - Methods taking a list return `[]` for an empty one, without opening a connection. An empty list would build `IN ()`, which is a SQL syntax error, and an upstream filter that legitimately matches nothing should yield no rows rather than an error
-- `_stop_row_to_dict(row)` — shared mapper used by `get_leg_stops`, `get_movement_stops`, and `get_order_stops`
+- `_stop_row_to_dict(row)` — shared mapper for `search_stops` results, 30 columns wide
 - `_fetch_all_objects(cursor, cls)` — generic row-to-object mapper for dataclass-style models
 
 ### Order Search
@@ -295,6 +293,9 @@ values were supplied. **Adding a searchable field is one line in that dict.**
 - Unknown filter names raise instead of being ignored, so a typo can never silently
   widen the result set.
 - At least one filter is required — an unfiltered search would scan all ~326k orders.
+  A name the tool's JSON schema does not know is dropped *before* `_build_where`
+  runs, so a misspelled parameter surfaces as this error rather than as
+  "Unknown filter". The message says to check the spelling for that reason.
 - Both tools fetch `limit + 1` rows and return `truncated` so the model can tell a
   partial answer from a complete one.
 - `summarize_orders` exists so aggregate questions don't pull thousands of rows into
@@ -313,6 +314,83 @@ so match on `cty_name` and `cty_state`, which is what `resolve_cities` does.
 
 Location has three precisions, exposed as separate filters rather than guessed at:
 `origin_company` (a `cmp_id`, most precise), `origin_city` (code), `origin_state`.
+
+### Stop Search
+
+`search_stops` replaced `get_leg_stops`, `get_movement_stops` and
+`get_order_stops`, which were byte-identical 48-line methods differing only in
+their one `WHERE` line. `_STOP_FILTERS` follows `_ORDER_FILTERS`, and the
+assembler is handed `{**_ORDER_FILTERS, **_STOP_FILTERS}`, so an order filter
+such as `billto` or `revtype1` composes with any stop filter in one query.
+
+**`scope` is the one argument that changes the meaning of the answer, not just
+its size.**
+
+| `scope` | Returns | `limit` bounds |
+|---------|---------|----------------|
+| `"stop"` (default) | the matching stops themselves | stops |
+| `"movement"` | every stop on every movement a match belongs to — the Trip Folder view | **movements** |
+
+This is not cosmetic: **267,192 of 344,345 movements carry stops from more than
+one order**, so for roughly three orders in four, movement scope returns stops
+the order does not own — the co-loaded freight sharing the trailer. Order 373
+has 2 stops of its own and 7 in its movement. The old `get_order_stops` was
+movement scope; the other two were stop scope. Collapsing `orders` into a plain
+`s.ord_hdrnumber IN (...)` would therefore have silently shrunk the most common
+lookup in the system, which is why scope stayed an explicit argument rather
+than being inferred from which filters were supplied.
+
+Movement scope drops an overflow movement whole rather than truncating it
+mid-trip, which would read as a short trip. Fan-out is bounded — 4.8 stops per
+movement on average, 84 at the worst, 199 movements above 20 — so `limit`
+movements is at most a few thousand rows.
+
+It also surfaces stops with `ord_hdrnumber = 0`, which is **not an order**:
+there is no row 0 in `orderheader`. Those 790k stops are empty equipment events
+(`BMT`, `DMT`, `DLT`, `HLT`, `RTP`) on the empty legs a movement may carry at
+either end, so they are legitimate trip context, and `ord_number` /
+`order_status` come back NULL for them.
+
+Naming: `stop_status` and `departure_status` are the stop's, while plain
+`status` and `invoice_status` are the **order's**, inherited from
+`_ORDER_FILTERS`. Likewise `cities` / `states` / `companies` are where the stop
+is, and `origin_city` / `dest_state` / `origin_company` are the order's
+endpoints. `orders` is the one deliberate collision — the stop table wins,
+because `s.ord_hdrnumber` seeks `sk_stp_ordnum` directly where
+`oh.ord_hdrnumber` would go through the join.
+
+Filtering is in SQL because `stops` is indexed for almost exactly these
+predicates: `sk_stp_ordnum`, `dk_lghnum`, `dk_mov`, `dk_stp_type`,
+`sk_stp_arrvdt`, `dk_stops_sch_seq`, `dk_stpdetstatus`, `dk_cmparrival`,
+`ix_stp_city`, `sk_stops_stp_refnum`, `ix_stops_HLT`, plus `dk_lgh_driver1`,
+`ix_lh_dr2_outst_stdt`, `dk_tractor` and `dk_lgh_carrier_enddate` on
+`legheader`. Measured: leg or movement lookup 4ms, a filtered search 16-27ms.
+
+Two filters have no index and scan 1.6M rows alone — `trailers`
+(`stops.trl_id` is unindexed) and `late_arrival` (a column-to-column
+comparison). Both are documented as needing a date or status partner.
+
+**`drivers` matches either seat** — a team driver's stops are found whichever
+seat they held. It is written as two indexed seeks `UNION`ed into an
+`s.lgh_number IN (...)`, **not** as
+`lgh_driver1 IN (..) OR lgh_driver2 IN (..)`: the `OR` form cannot use
+`dk_lgh_driver1` and `ix_lh_dr2_outst_stdt` at the same time and scanned
+`legheader` for **3.1 seconds**, against milliseconds for the `UNION`. That is
+what the `list_x2` filter kind is for — `str.format` fills every `{ph}` in a
+fragment, so a fragment naming the placeholder set twice needs its values bound
+twice over.
+
+`search_stops` uses the same **deferred join** as `search_freight`, for the same
+reason: 30 output columns across six tables in the query that also carries the
+`TOP` / `ORDER BY` costs the optimiser the ordered scan the row goal allows.
+Selection order is most-recent-first; presentation order is trip order
+(movements by first arrival, then chronological within each), which is what
+preserved the old methods' output ordering exactly. Every `ORDER BY` ends with
+`stp_number`, because stops in a leg can share an arrival date and without the
+tiebreaker which rows land inside `TOP` could vary between identical calls.
+
+Equivalence was verified against the three removed methods on an eight-order
+sample: all 31 rows identical, in the same order, on all three mappings.
 
 ### Freight Detail
 
