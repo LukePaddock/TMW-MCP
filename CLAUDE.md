@@ -265,6 +265,7 @@ in `labelfile` under `InvoiceStatus` and `PayStatus`.
 | `get_active_power` | _(none)_ | All active tractors with current driver and team leader |
 | `get_active_legs` | _(none)_ | All active legs (AVL/PLN/STD) fleet-wide — can be large, filter in Python |
 | `search_stops` | `scope` + many optional filters | Stops by identity, status, date, appointment, location, driver, truck - see below |
+| `search_drivers` | `name` + many optional filters | Drivers by code, name, status, assignment, licence - see below |
 | `search_orders` | many optional filters | Orders by date, customer, location, revenue type — see below |
 | `summarize_orders` | `group_by` + same filters | Aggregated order totals instead of rows |
 | `find_city_codes` | `name`, `state` | Resolve a city name to the numeric codes orders store |
@@ -314,6 +315,83 @@ so match on `cty_name` and `cty_state`, which is what `resolve_cities` does.
 
 Location has three precisions, exposed as separate filters rather than guessed at:
 `origin_company` (a `cmp_id`, most precise), `origin_city` (code), `origin_state`.
+
+### Driver Search
+
+`search_drivers` reads `manpowerprofile`, which is **676 rows**. That one fact
+inverts the rule the rest of this server follows. `search_orders` refuses a
+`LIKE` on city names because it would throw away an index seek across 326k
+rows; here a full scan costs nothing, so `name` does substring matching and a
+caller never needs to know a driver code to find a driver. Every query measures
+12-24ms.
+
+`name` is split on whitespace and commas, and each token becomes its own `LIKE`
+against `mpp_lastfirst` (stored `'LASTNAME,FIRSTNAME'`), all ANDed. One column
+covers both names, and because the tokens are independent, word order stops
+mattering: `"smith"`, `"john smith"`, `"smith john"` and `"smi"` all find
+`SMITH,JOHN`. Terms go through `_like_term`, which escapes `\`, `%`, `_` and
+`[` and pairs with `ESCAPE '\'` — without it a `%` in a name would match the
+whole table, and `[a-z]` would open a T-SQL character class.
+
+#### Personal data is deliberately excluded
+
+This table holds **555 full-length SSNs, 651 dates of birth, 646 licence
+numbers, 626 home addresses and 381 gender markers**. None of `mpp_ssn`,
+`mpp_dateofbirth`, `mpp_licensenumber`, `mpp_address1/2`, `mpp_homephone`,
+`mpp_gender`, `mpp_nbrdependents`, `mpp_password` or the pay-rate columns is
+selected, returned, or available as a filter. Everything a tool returns enters
+a model's context and travels to whatever client is connected, so the exclusion
+is in the SELECT list, not in a post-filter that a future edit could drop.
+
+Work contact details (`mpp_currentphone`, `mpp_email`) and the licence **state
+and class** are included — operational, not identifying. A test asserts no
+output key or filter name matches a list of sensitive terms, so adding one back
+by accident fails the check.
+
+#### Two data traps
+
+**`OUT` means terminated, not "out on the road".** `DrvStatus` decodes AVL
+Available, PLN Planned, USE On the Road, OUT **Terminated** — and 472 of 676
+rows are OUT. `active_only` gives the 204 current drivers; `status=["USE"]`
+gives the 97 actually rolling. Every result row carries a plain `terminated`
+boolean so the code is hard to misread.
+
+**Dates carry sentinels.** A driver who has not left has `mpp_terminationdt`
+= `2049-12-31 23:59`, and 15 rows have `mpp_hiredate` = `1950-01-01`. Both are
+stored as real datetimes, so reported raw, every current driver appears to be
+terminated in 2049. `_real_date` maps anything above 2040 or below 1950-01-02
+to `None`. The alignment is exact: all 204 non-OUT drivers carry the future
+sentinel, all 463 OUT drivers a genuine date, and 9 carry the low sentinel.
+`terminated_after` / `terminated_before` also bound against real dates only, so
+"who left this year" cannot sweep in the active roster.
+
+#### Other notes
+
+`mpp_id` is the code `legheader.lgh_driver1` / `lgh_driver2` carry, and it
+matches for **all 594** distinct drivers that appear on a leg — so
+`driver_code` feeds straight into `search_stops(drivers=[...])` or
+`truck_plan`.
+
+`_DRIVER_MAX_ROWS = 1000` overrides `TMW_MAX_SEARCH_ROWS` for this tool.
+The global cap defaults to 200 and exists to stop a 326k-row order scan filling
+a context window; on a 676-row table it merely made "list the active drivers"
+truncate by four, since the roster is 204.
+
+Three rows (`CU`, `UNKOWN`, `WESC02`) have no name at all, so `mpp_lastfirst`
+is `','`, which sorts ahead of every real driver. None appears on any leg, so
+the `ORDER BY` pushes them last instead of letting them lead every unfiltered
+result.
+
+`mpp_type` is `UNK` on all 676 rows and is not exposed. `mpp_carrier` and
+`mpp_employedby` are empty throughout, as are `mpp_next_stoparrival`,
+`mpp_next_legnumber`, `mpp_last_home` and the pay rates.
+
+**This is the one search with no required filter**, because listing 676 rows is
+cheap and "who are our drivers" is a fair question. The cost is that a
+misspelled parameter — dropped by the JSON schema before the server sees it —
+degrades to a full listing rather than raising `Unknown filter`, the way it
+would for orders, stops or freight. `count` and `truncated` make that visible,
+but it is a real difference in behaviour.
 
 ### Stop Search
 

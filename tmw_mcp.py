@@ -117,6 +117,105 @@ def get_active_legs() -> list[dict]:
 
 
 @mcp.tool()
+def search_drivers(
+    name: str | None = None,
+    drivers: list[str] | None = None,
+    other_ids: list[str] | None = None,
+    status: list[str] | None = None,
+    active_only: bool = False,
+    terminated_only: bool = False,
+    trucks: list[str] | None = None,
+    team_leaders: list[str] | None = None,
+    terminals: list[str] | None = None,
+    fleets: list[str] | None = None,
+    divisions: list[str] | None = None,
+    domiciles: list[str] | None = None,
+    companies: list[str] | None = None,
+    license_states: list[str] | None = None,
+    license_classes: list[str] | None = None,
+    cities: list[int] | None = None,
+    states: list[str] | None = None,
+    hired_after: str | None = None,
+    hired_before: str | None = None,
+    terminated_after: str | None = None,
+    terminated_before: str | None = None,
+    available_after: str | None = None,
+    available_before: str | None = None,
+    trainers: bool = False,
+    trainees: bool = False,
+    limit: int = 200,
+) -> dict:
+    """Find drivers by code, name, status, assignment, or licence.
+
+    Unlike the order, stop and freight searches, NO filter is required here —
+    the driver table is only 676 rows, so an unfiltered call is a reasonable
+    "who are our drivers". For the same reason name matching is a substring
+    search, which the bigger tables cannot afford.
+
+    NAME SEARCH. name is split on whitespace and commas, and every token must
+    appear in the stored 'LASTNAME,FIRSTNAME'. So "smith", "john smith",
+    "smith john" and "smi" all find SMITH,JOHN. Matching is case-insensitive
+    and wildcards are taken literally, so a '%' in the name matches a percent
+    sign rather than everything.
+
+    STATUS is the field to watch: 472 of 676 drivers are OUT, which in
+    DrvStatus means TERMINATED, not "out on the road". Pass active_only=True
+    for the current roster (204 drivers), or status=["USE"] for the 97 actually
+    on the road right now. The other codes are AVL (available) and PLN
+    (planned). Every result carries a plain `terminated` boolean so this is
+    hard to misread.
+
+    DATES. hire_date and termination_date come back null where TMW stored a
+    placeholder rather than a real date — a current driver has 2049-12-31 on
+    file, which is not a real termination. terminated_after / terminated_before
+    only match genuine dates, so "who left this year" cannot sweep in the
+    active roster.
+
+    The driver_code this returns is the code legheader stores, so it feeds
+    straight into search_stops(drivers=[...]) to see where someone has been,
+    or truck_plan for what is ahead of them.
+
+    PERSONAL DATA IS NOT AVAILABLE through this tool. The underlying table
+    holds social security numbers, dates of birth, licence numbers, home
+    addresses and gender markers; none of those are returned or searchable, by
+    design. Work contact details (phone, email) and the licence state and class
+    are included. If a question needs an excluded field, it has to be answered
+    outside this server.
+
+    Returns {"drivers": [...], "count": n, "truncated": bool}. Three rows carry
+    no name at all and sort last; none of them appears on a real trip.
+    """
+    return db.search_drivers(
+        name=name,
+        limit=limit,
+        drivers=drivers,
+        other_ids=other_ids,
+        status=status,
+        active_only=active_only,
+        terminated_only=terminated_only,
+        trucks=trucks,
+        team_leaders=team_leaders,
+        terminals=terminals,
+        fleets=fleets,
+        divisions=divisions,
+        domiciles=domiciles,
+        companies=companies,
+        license_states=license_states,
+        license_classes=license_classes,
+        cities=cities,
+        states=states,
+        hired_after=hired_after,
+        hired_before=hired_before,
+        terminated_after=terminated_after,
+        terminated_before=terminated_before,
+        available_after=available_after,
+        available_before=available_before,
+        trainers=trainers,
+        trainees=trainees,
+    )
+
+
+@mcp.tool()
 def search_stops(
     scope: str = "stop",
     orders: list[int] | None = None,

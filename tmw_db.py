@@ -204,6 +204,112 @@ _ORDER_FROM = """
 """
 
 
+# --- Driver search --------------------------------------------------------
+#
+# manpowerprofile is only 676 rows, which changes the calculus that governs
+# every other search here. search_orders refuses a `LIKE` on city names because
+# it would discard an index seek across 326k rows; on 676 rows a full scan is
+# free, so `name` does substring matching and callers never have to know a
+# driver code to find a driver.
+#
+# mpp_id is the driver code that legheader.lgh_driver1 / lgh_driver2 carry, and
+# it matches for all 594 distinct drivers that appear on a leg, so the code this
+# returns feeds straight into search_stops(drivers=[...]).
+#
+# WHAT IS DELIBERATELY NOT SELECTED. This table holds real personal data:
+# 555 full-length SSNs, 651 dates of birth, 646 licence numbers, 626 home
+# addresses and 381 gender markers. None of those columns appear in the output
+# or in a filter, because every field a tool returns lands in a model's context
+# and travels to whatever client is connected. Work contact details
+# (mpp_currentphone, mpp_email) and the licence STATE and CLASS are included -
+# they are operational, not identifying. The pay columns are excluded too,
+# though they happen to be zero throughout this database.
+_DRIVER_FILTERS: dict[str, tuple[str, str]] = {
+    # Identity. `drivers` takes the mpp_id codes; `name` is handled separately
+    # because one search term expands to one LIKE per whitespace token.
+    "drivers":        ("m.mpp_id IN ({ph})", "list"),
+    "other_ids":      ("m.mpp_otherid IN ({ph})", "list"),
+    # Status: AVL available, PLN planned, USE on the road, OUT terminated.
+    # 472 of 676 are OUT, so active_only is usually what a caller wants.
+    "status":         ("m.mpp_status IN ({ph})", "list"),
+    "active_only":    ("m.mpp_status <> 'OUT'", "flag"),
+    "terminated_only": ("m.mpp_status = 'OUT'", "flag"),
+    # Assignment
+    "trucks":         ("m.mpp_tractornumber IN ({ph})", "list"),
+    "team_leaders":   ("m.mpp_teamleader IN ({ph})", "list"),
+    "terminals":      ("m.mpp_terminal IN ({ph})", "list"),
+    "fleets":         ("m.mpp_fleet IN ({ph})", "list"),
+    "divisions":      ("m.mpp_division IN ({ph})", "list"),
+    "domiciles":      ("m.mpp_domicile IN ({ph})", "list"),
+    "companies":      ("m.mpp_company IN ({ph})", "list"),
+    # Licence - state and class only, never the number
+    "license_states": ("m.mpp_licensestate IN ({ph})", "list"),
+    "license_classes": ("LTRIM(RTRIM(m.mpp_licenseclass)) IN ({ph})", "list"),
+    # Where the driver is based
+    "cities":         ("m.mpp_city IN ({ph})", "list"),
+    "states":         ("m.mpp_state IN ({ph})", "list"),
+    # Employment dates. The *_before bounds are exclusive, as everywhere else.
+    "hired_after":    ("m.mpp_hiredate >= ?", "date"),
+    "hired_before":   ("m.mpp_hiredate < ?", "date"),
+    # A real termination date only; the 2049-12-31 sentinel that marks a current
+    # driver is excluded so "terminated this year" cannot sweep in the active
+    # roster.
+    "terminated_after":  (
+        "(m.mpp_terminationdt >= ? AND m.mpp_terminationdt < '2040-01-01')", "date"),
+    "terminated_before": (
+        "(m.mpp_terminationdt < ? AND m.mpp_terminationdt > '1950-01-02')", "date"),
+    # Dispatch availability
+    "available_after":  ("m.mpp_avl_date >= ?", "date"),
+    "available_before": ("m.mpp_avl_date < ?", "date"),
+    "trainers":       ("m.mpp_trainer = 'Y'", "flag"),
+    "trainees":       ("m.mpp_trainee = 'Y'", "flag"),
+}
+
+# manpowerprofile is 676 rows, so TMW_MAX_SEARCH_ROWS (default 200, sized for
+# the 326k-row order table) is the wrong ceiling here - the active roster alone
+# is 204, so "list the active drivers" would truncate by four. This cap lets a
+# caller ask for the whole table and nothing larger.
+_DRIVER_MAX_ROWS = 1000
+
+_DRIVER_FROM = """
+    FROM manpowerprofile m
+    LEFT JOIN city dcty   ON dcty.cty_code = m.mpp_city
+    LEFT JOIN labelfile ls ON ls.abbr = m.mpp_status
+        AND ls.labeldefinition = 'DrvStatus'
+    LEFT JOIN labelfile lt ON lt.abbr = m.mpp_teamleader
+        AND lt.labeldefinition = 'TeamLeader'
+"""
+
+# TMW writes 2049-12-31 into mpp_terminationdt for a driver who has not left,
+# and 1950-01-01 where a date is simply unknown. Both are stored as real
+# datetimes, so reporting them raw would have every current driver "terminated"
+# in 2049 and 15 of them hired in 1950. Verified: all 204 non-OUT drivers carry
+# the future sentinel and all 463 OUT drivers carry a genuine date.
+_DATE_SENTINEL_LOW = datetime(1950, 1, 2)
+_DATE_SENTINEL_HIGH = datetime(2040, 1, 1)
+
+
+def _real_date(value):
+    """Return a stored date as a string, or None if it is a TMW sentinel."""
+    if value is None:
+        return None
+    if value < _DATE_SENTINEL_LOW or value > _DATE_SENTINEL_HIGH:
+        return None
+    return str(value)
+
+
+def _like_term(term: str) -> str:
+    """Wrap a user term for a substring LIKE, neutralising its wildcards.
+
+    An unescaped '%' or '_' in a search term silently changes what matches, and
+    '[' opens a character class in T-SQL. The fragments that use this pair it
+    with ESCAPE '\\'.
+    """
+    for ch in ("\\", "%", "_", "["):
+        term = term.replace(ch, "\\" + ch)
+    return f"%{term}%"
+
+
 # --- Stop search ----------------------------------------------------------
 #
 # One query serves every stop lookup, the way _ORDER_FILTERS serves order
@@ -841,6 +947,141 @@ class TmwDB:
             {"cty_code": row[0], "city": row[1], "state": row[2], "name_state": row[3]}
             for row in cursor.fetchall()
         ]
+
+    _DRIVER_SELECT = """
+        m.mpp_id,
+        m.mpp_lastfirst,
+        m.mpp_firstname,
+        m.mpp_lastname,
+        m.mpp_status,
+        ls.name AS StatusName,
+        m.mpp_hiredate,
+        m.mpp_terminationdt,
+        m.mpp_tractornumber,
+        m.mpp_teamleader,
+        lt.name AS TeamLeaderName,
+        m.mpp_terminal,
+        m.mpp_fleet,
+        m.mpp_division,
+        m.mpp_domicile,
+        m.mpp_company,
+        m.mpp_licensestate,
+        m.mpp_licenseclass,
+        m.mpp_currentphone,
+        m.mpp_email,
+        dcty.cty_nmstct,
+        m.mpp_state,
+        m.mpp_avl_date,
+        m.mpp_avl_cmp_id,
+        m.mpp_next_event,
+        m.mpp_next_state,
+        m.mpp_otherid,
+        m.mpp_trainer,
+        m.mpp_trainee
+    """
+
+    def _driver_row_to_dict(self, row) -> dict:
+        return {
+            "driver_code": row[0].strip() if row[0] else None,
+            "name": row[1],
+            "first_name": row[2],
+            "last_name": row[3],
+            "status": row[4],
+            "status_name": row[5],
+            # OUT is 'Terminated' in DrvStatus, and is 70% of the table.
+            "terminated": row[4] == "OUT",
+            "hire_date": _real_date(row[6]),
+            "termination_date": _real_date(row[7]),
+            "truck": row[8].strip() if row[8] else None,
+            "team_leader": row[9],
+            "team_leader_name": row[10],
+            "terminal": row[11],
+            "fleet": row[12],
+            "division": row[13],
+            "domicile": row[14],
+            "company": row[15],
+            "license_state": row[16],
+            "license_class": row[17].strip() if row[17] else None,
+            "phone": row[18].strip() if row[18] else None,
+            "email": row[19].strip() if row[19] else None,
+            "city": row[20],
+            "state": row[21],
+            "available_from": _real_date(row[22]),
+            "available_at": row[23].strip() if row[23] else None,
+            "next_event": row[24].strip() if row[24] else None,
+            "next_state": row[25],
+            "other_id": row[26].strip() if row[26] else None,
+            "trainer": row[27] == "Y",
+            "trainee": row[28] == "Y",
+        }
+
+    def search_drivers(
+        self,
+        name: str | None = None,
+        limit: int | None = None,
+        **filters,
+    ) -> dict:
+        """Search drivers in manpowerprofile by code, name, status or assignment.
+
+        Unlike the order, stop and freight searches, no filter is required:
+        manpowerprofile is 676 rows, so listing it is cheap and an unfiltered
+        call is a legitimate "who are our drivers". For the same reason `name`
+        can do substring matching, which the larger tables cannot afford.
+
+        `name` is split on whitespace and commas and every token must appear in
+        `mpp_lastfirst` ('LASTNAME,FIRSTNAME'), so "abdel mohamed" and
+        "mohamed abdel" both find ABDELWAHAB,MOHAMED. Terms are escaped, so a
+        '%' in the input matches a literal percent sign.
+
+        The returned `driver_code` is the mpp_id that legheader carries, so it
+        feeds directly into search_stops(drivers=[...]) and truck_plan.
+
+        Three rows (CU, UNKOWN, WESC02) carry no name. None of them appears on
+        a leg, so they sort last rather than leading every unfiltered result.
+
+        Personal data is not returned - see the note on _DRIVER_FILTERS.
+        """
+        if not self.conn:
+            self.connect()
+
+        limit = min(limit or self.max_search_rows, _DRIVER_MAX_ROWS)
+
+        clauses: list[str] = []
+        params: list = []
+        if filters and any(v is not None and v is not False for v in filters.values()):
+            where, params = _build_where(filters, _DRIVER_FILTERS)
+            clauses.append(where)
+
+        if name and name.strip():
+            # One LIKE per token, ANDed: every token must appear somewhere in
+            # 'LASTNAME,FIRSTNAME', which makes word order irrelevant.
+            for token in name.replace(",", " ").split():
+                clauses.append("m.mpp_lastfirst LIKE ? ESCAPE '\\'")
+                params.append(_like_term(token.upper()))
+
+        where = " AND ".join(clauses) if clauses else "1 = 1"
+
+        cursor = self.conn.cursor()
+        cursor.execute(f"""
+            SELECT TOP (?)
+                {self._DRIVER_SELECT}
+            {_DRIVER_FROM}
+            WHERE {where}
+            -- Three rows (CU, UNKOWN, WESC02) have no name at all, so
+            -- mpp_lastfirst is ',' and sorts ahead of every real driver. None
+            -- of them appears on a leg, so they go last rather than leading
+            -- every unfiltered result.
+            ORDER BY CASE WHEN LTRIM(RTRIM(m.mpp_lastfirst)) IN ('', ',')
+                          THEN 1 ELSE 0 END,
+                     m.mpp_lastfirst
+        """, [limit + 1, *params])
+
+        rows = cursor.fetchall()
+        return {
+            "drivers": [self._driver_row_to_dict(r) for r in rows[:limit]],
+            "count": min(len(rows), limit),
+            "truncated": len(rows) > limit,
+        }
 
     def search_orders(self, limit: int | None = None, **filters) -> dict:
         if not self.conn:

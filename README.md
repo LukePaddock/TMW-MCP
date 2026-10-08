@@ -297,12 +297,30 @@ compose.yml.example     Container config template (copy to compose.yml)
 | `get_active_power` | _(none)_ | Active tractors with current driver and team leader |
 | `get_active_legs` | _(none)_ | All active legs (AVL/PLN/STD) fleet-wide |
 | `search_stops` | `scope` + many optional filters | Stops by identity, status, date, appointment, location, driver, truck |
+| `search_drivers` | `name` + many optional filters | Drivers by code, name, status, assignment, licence |
 | `search_orders` | many optional filters | Orders by date, customer, location, revenue type |
 | `summarize_orders` | `group_by` + same filters | Aggregated order totals instead of rows |
 | `find_city_codes` | `name`, `state` | Resolve a city name to the numeric codes orders store |
 | `get_order_freight` | `orders`, `stop_type` | Freight lines per order; DRP (delivery) copies by default |
 | `summarize_order_freight` | `orders` | Per-order freight totals, with PUP vs DRP `in_sync` flag |
 | `search_freight` | freight + order filters | Freight by commodity, weight, temperature, dimensions |
+
+`search_drivers` looks up the 676-row driver table by code or by name. Because
+the table is small, `name` is a substring search and word order does not
+matter: `"smith"`, `"john smith"` and `"smi"` all find SMITH,JOHN. Other
+filters cover status, dispatch team, terminal, fleet, assigned truck, licence
+state and class, and hire or termination date ranges. The `driver_code` it
+returns is what `search_stops(drivers=[...])` and `truck_plan` expect.
+
+Two things to know about the data. **`OUT` means terminated** — 472 of 676
+drivers are OUT, so pass `active_only=True` for the 204 current ones, or
+`status=["USE"]` for the 97 on the road. And TMW stores `2049-12-31` as the
+termination date of a driver who has not left, so `termination_date` comes back
+null in that case rather than claiming a date in 2049.
+
+**Personal data is not exposed.** The table holds social security numbers,
+dates of birth, licence numbers, home addresses and gender markers; none are
+returned or searchable. Work phone, email, and the licence state and class are.
 
 `search_stops` answers every stop question through one query. Filters cover
 identity (`orders`, `legs`, `movements`, `stops`), classification
