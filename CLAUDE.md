@@ -250,6 +250,36 @@ leg vocabulary applies to `orderheader`.
 `ord_invoicestatus`: `PPD`, `XIN`, `AVL`, `PND`, `CMP`. Invoice and pay statuses live
 in `labelfile` under `InvoiceStatus` and `PayStatus`.
 
+### Revenue Types
+
+`labelfile.userlabelname` names the four `ord_revtypeN` columns:
+
+| Column | Meaning | Values |
+|--------|---------|--------|
+| `ord_revtype1` | **Booking company** — the sub-company that booked the load | EPT, JSV, TSC, PKS; CFS retired 2018 |
+| `ord_revtype2` | Region | LOCAL, INBOUN, OUTBOU |
+| `ord_revtype3` | Taxable | YES, NO |
+| `ord_revtype4` | **Booking agent** — the person who booked it | ~20 first names |
+
+Revtype1 and 4 are exposed under their meaning as `booking_company` /
+`booking_agent` — filter, `group_by`, a decoded name on `search_orders` rows, and
+a list tool each. `booking_company`, not `company`, because `companies` and
+`*_company` already mean a `cmp_id` facility.
+
+**RevType4 was repurposed.** It first held a load class — `LEGAL` (164,395
+orders), `VAN` (38,633), `WIDTH`, `WEIGHT`, `HEIGHT`, `WH`, `XATA`, all retired,
+last used 2022. Agent codes overlap them from 2003, so no date cut-off separates
+the eras. `_REVTYPE4_LEGACY` lists them; `booking_agent` is NULL for those orders,
+the filter never matches them, and `group_by="booking_agent"` folds them into one
+NULL group. Otherwise `LEGAL` would be the busiest agent in history. The raw
+`revtype4` filter and group are unchanged and still see them.
+
+Both filters accept the **code or the name** (`_label_filter`), because codes are
+truncated to six characters and four agents differ: `CAMER`/CAMERON,
+`JENN`/JENNIFER, `STEW`/STEWART, `KRIS`/KRISTEN. Collation is case-insensitive.
+Agents are not tied to one company — MADDIE books for all four — so the two
+filters compose.
+
 ### Stop Status Fields
 
 - `stp_status = 'DNE'` — driver has **arrived** at the stop
@@ -269,6 +299,8 @@ in `labelfile` under `InvoiceStatus` and `PayStatus`.
 | `search_orders` | many optional filters | Orders by date, customer, location, revenue type — see below |
 | `summarize_orders` | `group_by` + same filters | Aggregated order totals instead of rows, split by currency |
 | `find_city_codes` | `name`, `state` | Resolve a city name to the numeric codes orders store |
+| `list_booking_agents` | `include_retired` | Booking agents (revtype4) with order counts and first/last order |
+| `list_booking_companies` | `include_retired` | Booking sub-companies (revtype1), same shape |
 | `get_order_freight` | `orders`, `stop_type` | Freight lines per order; DRP (delivery) copies by default |
 | `summarize_order_freight` | `orders` | Per-order freight totals, with PUP vs DRP `in_sync` flag |
 | `search_freight` | freight + order filters | Freight by commodity, weight, temperature, dimensions |

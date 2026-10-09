@@ -96,6 +96,19 @@ movement begins with an XDL (Cross-Dock Load).
 - `PLN` — Planned (assigned, not yet started)
 - `STD` — Started (in progress)
 - `DNE` — Done (completed)
+
+## Revenue Types on Orders
+The four `revtype` fields are customer-defined classifications. Codes are truncated to six characters.
+- `revtype1` — **Booking Company**: the sub-company that booked the load. EPT (Earl Paddock Transpo),
+  JSV (J Syvret), TSC (Trafalgar), PKS (Packers); CFS (EP Logistics) is retired. Use the
+  `booking_company` filter and group_by, and `list_booking_companies`. Not to be confused with
+  `companies` / `origin_company` / `dest_company`, which are customer facility IDs (cmp_id).
+- `revtype2` — **Region**: LOCAL, INBOUN (Inbound), OUTBOU (Outbound).
+- `revtype3` — **Taxable**: YES, NO.
+- `revtype4` — **Booking Agent**: the person who booked the load. Use the `booking_agent` filter and
+  group_by rather than `revtype4`, and `list_booking_agents` to see who they are. Older orders may hold
+  a retired load-class code here instead (LEGAL, VAN, WIDTH, ...) — those are not agents.
+UNK in any of these means not recorded.
 """)
 settings = load_settings()
 db = TmwDB.from_settings(settings)
@@ -257,6 +270,8 @@ def search_stops(
     revtype2: list[str] | None = None,
     revtype3: list[str] | None = None,
     revtype4: list[str] | None = None,
+    booking_company: list[str] | None = None,
+    booking_agent: list[str] | None = None,
     started_after: str | None = None,
     started_before: str | None = None,
     completed_after: str | None = None,
@@ -298,8 +313,9 @@ def search_stops(
 
     STOP vs ORDER fields. stop_status and departure_status are the stop's; plain
     status and invoice_status are the ORDER's, as are billto, shipper, consignee,
-    revtype1-4 and started_after/before, so you can ask for stops on a customer's
-    orders without a second query. stop_status is DNE (arrived), NON or OPN;
+    revtype1-4, booking_company, booking_agent and started_after/before, so you
+    can ask for stops on a customer's orders without a second query. stop_status
+    is DNE (arrived), NON or OPN;
     departure_status DNE means the driver has left. unarrived and undeparted are
     the shorthands for "not there yet" and "still there".
 
@@ -379,6 +395,8 @@ def search_stops(
         revtype2=revtype2,
         revtype3=revtype3,
         revtype4=revtype4,
+        booking_company=booking_company,
+        booking_agent=booking_agent,
         started_after=started_after,
         started_before=started_before,
         completed_after=completed_after,
@@ -422,6 +440,41 @@ def find_city_codes(name: str, state: str | None = None) -> list[dict]:
 
 
 @mcp.tool()
+def list_booking_agents(include_retired: bool = True) -> list[dict]:
+    """List the booking agents — the people who book loads — with their order activity.
+
+    The booking agent is stored in the order's revtype4. Each row carries the
+    agent's code (`booking_agent`), their name, whether they are retired, and
+    their order_count, first_order and last_order dates across all history.
+    last_order can be in the future for loads already booked ahead.
+
+    Either the code or the name works in the booking_agent filter of
+    search_orders, summarize_orders, search_stops and search_freight. They
+    usually match, but not always — CAMER is CAMERON, JENN is JENNIFER.
+
+    Retired agents are included by default because their orders remain in the
+    history; pass include_retired=False for the current team only.
+    """
+    return db.list_booking_agents(include_retired)
+
+
+@mcp.tool()
+def list_booking_companies(include_retired: bool = True) -> list[dict]:
+    """List the sub-companies that book loads, with their order activity.
+
+    The booking company is stored in the order's revtype1. Each row carries the
+    code (`booking_company`), its name, whether it is retired, and its
+    order_count, first_order and last_order dates across all history.
+
+    Either the code or the name works in the booking_company filter of
+    search_orders, summarize_orders, search_stops and search_freight — ["TSC"]
+    and ["Trafalgar"] are the same. Combine it with booking_agent to see who
+    books for which company; most agents book for one, but some book for several.
+    """
+    return db.list_booking_companies(include_retired)
+
+
+@mcp.tool()
 def search_orders(
     started_after: str | None = None,
     started_before: str | None = None,
@@ -436,6 +489,8 @@ def search_orders(
     revtype2: list[str] | None = None,
     revtype3: list[str] | None = None,
     revtype4: list[str] | None = None,
+    booking_company: list[str] | None = None,
+    booking_agent: list[str] | None = None,
     origin_company: list[str] | None = None,
     dest_company: list[str] | None = None,
     origin_city: list[int] | None = None,
@@ -459,6 +514,15 @@ def search_orders(
 
     Order statuses here are CMP (completed), CAN (cancelled), QTE (quote), AVL,
     PLN, STD, PND — not the AVL/PLN/STD/DNE set used for legs and movements.
+
+    BOOKING COMPANY AND AGENT. booking_company filters on the sub-company that
+    booked the load (revtype1) and booking_agent on the person (revtype4). Both
+    accept a code or a name (["JENN"] and ["Jennifer"] are the same);
+    list_booking_companies and list_booking_agents show the values. Each result
+    carries booking_company_name, booking_agent and booking_agent_name. The
+    agent fields are null on older orders whose revtype4 holds a retired load
+    class (LEGAL, VAN, ...) rather than an agent — the raw code is still in
+    revtype4. Before 2022 many orders have no agent.
 
     CURRENCY. This is a mixed-currency database — 84% of orders are Canadian
     dollars, 16% US — so total_charge means nothing without the currency beside
@@ -493,6 +557,8 @@ def search_orders(
         revtype2=revtype2,
         revtype3=revtype3,
         revtype4=revtype4,
+        booking_company=booking_company,
+        booking_agent=booking_agent,
         origin_company=origin_company,
         dest_company=dest_company,
         origin_city=origin_city,
@@ -522,6 +588,8 @@ def summarize_orders(
     revtype2: list[str] | None = None,
     revtype3: list[str] | None = None,
     revtype4: list[str] | None = None,
+    booking_company: list[str] | None = None,
+    booking_agent: list[str] | None = None,
     origin_company: list[str] | None = None,
     dest_company: list[str] | None = None,
     origin_city: list[int] | None = None,
@@ -535,9 +603,15 @@ def summarize_orders(
     """Aggregate orders into totals instead of listing them row by row.
 
     Takes the same filters as search_orders plus a required group_by, one of:
-    revtype1, revtype2, revtype3, revtype4, status, invoice_status, billto,
-    shipper, consignee, origin_city, dest_city, origin_state, dest_state,
-    month, year, currency.
+    revtype1, revtype2, revtype3, revtype4, booking_company, booking_agent,
+    status, invoice_status, billto, shipper, consignee, origin_city, dest_city,
+    origin_state, dest_state, month, year, currency.
+
+    group_by="booking_company" and "booking_agent" label each group with its
+    name. booking_agent also collects orders that carry a retired load class
+    instead of an agent into a single null group — prefer it over
+    group_by="revtype4", which would list LEGAL and VAN as though they were
+    people.
 
     Each group returns order_count, total_charge, total_miles, total_weight,
     and rev_per_mile, sorted by total_charge descending. Prefer this over
@@ -577,6 +651,8 @@ def summarize_orders(
         revtype2=revtype2,
         revtype3=revtype3,
         revtype4=revtype4,
+        booking_company=booking_company,
+        booking_agent=booking_agent,
         origin_company=origin_company,
         dest_company=dest_company,
         origin_city=origin_city,
@@ -667,6 +743,8 @@ def search_freight(
     status: list[str] | None = None,
     revtype1: list[str] | None = None,
     revtype2: list[str] | None = None,
+    booking_company: list[str] | None = None,
+    booking_agent: list[str] | None = None,
     origin_state: list[str] | None = None,
     dest_state: list[str] | None = None,
     origin_city: list[int] | None = None,
@@ -677,7 +755,8 @@ def search_freight(
     """Search freight lines by commodity, weight, temperature, dimensions, and order.
 
     At least one filter is required. Order-level filters (dates, billto, shipper,
-    consignee, status, revenue types, origin and destination) work here too, so
+    consignee, status, revenue types, booking company and agent, origin and
+    destination) work here too, so
     "oversize freight for this customer last quarter" is a single call.
 
     stop_type defaults to "DRP" — the delivery copies, which are the authoritative
@@ -761,6 +840,8 @@ def search_freight(
         status=status,
         revtype1=revtype1,
         revtype2=revtype2,
+        booking_company=booking_company,
+        booking_agent=booking_agent,
         origin_state=origin_state,
         dest_state=dest_state,
         origin_city=origin_city,

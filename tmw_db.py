@@ -47,6 +47,54 @@ def _norm_currency(values):
     return list(dict.fromkeys(out))
 
 
+# --- Booking company and agent (ord_revtype1 / ord_revtype4) ---------------
+#
+# labelfile.userlabelname names the four revenue types: RevType1 'Company',
+# RevType2 'Region', RevType3 'TAXABLE', RevType4 'Booking Agent'. RevType1 is
+# the sub-company that booked the load - EPT, JSV, TSC, PKS, and CFS, retired
+# since 2018. It is exposed as booking_company rather than `company`, because
+# `companies` and `*_company` already mean a cmp_id facility everywhere else.
+#
+# RevType4 was REPURPOSED. It first held a load class - LEGAL (164,395
+# orders), VAN (38,633), WIDTH, WEIGHT, HEIGHT, WH, XATA - all now retired and
+# last used in 2022. Agent codes ran alongside them from 2003, so both eras
+# overlap in time and a date cut-off cannot separate them. Treated as agents,
+# LEGAL would be the busiest booking agent in history. These codes are
+# therefore never reported as an agent: booking_agent comes back NULL for
+# them, while the raw revtype4 still carries the stored code. RevType1 has no
+# such history.
+_REVTYPE4_LEGACY = ("VAN", "LEGAL", "WIDTH", "WEIGHT", "HEIGHT", "WH", "XATA")
+_REVTYPE4_LEGACY_SQL = ", ".join(f"'{c}'" for c in _REVTYPE4_LEGACY)
+
+# The code, or NULL where the order carries a legacy load class instead.
+_BOOKING_AGENT = (
+    f"(CASE WHEN oh.ord_revtype4 IN ({_REVTYPE4_LEGACY_SQL}) "
+    "THEN NULL ELSE oh.ord_revtype4 END)"
+)
+_BOOKING_AGENT_NAME = (
+    f"(CASE WHEN oh.ord_revtype4 IN ({_REVTYPE4_LEGACY_SQL}) "
+    "THEN NULL ELSE ba.name END)"
+)
+
+
+def _label_filter(column: str, definition: str, exclude: str | None = None) -> tuple[str, str]:
+    """A list filter on a labelfile-coded column that takes the code OR the name.
+
+    Callers naturally pass the name, and codes are truncated to six characters,
+    so they often differ: CAMER is CAMERON, JENN is JENNIFER. The collation is
+    case-insensitive, so "Jennifer" matches too. `exclude` is a SQL list of
+    codes that must never match, whichever way they are spelled.
+    """
+    excl = f" AND lx.abbr NOT IN ({exclude})" if exclude else ""
+    return (
+        f"{column} IN ("
+        " SELECT lx.abbr FROM labelfile lx"
+        f" WHERE lx.labeldefinition = '{definition}'"
+        f" AND (lx.abbr IN ({{ph}}) OR lx.name IN ({{ph}})){excl})",
+        "list_x2",
+    )
+
+
 _ORDER_FILTERS: dict[str, tuple[str, str]] = {
     "orders":           ("oh.ord_hdrnumber IN ({ph})", "list"),
     "order_numbers":    ("oh.ord_number IN ({ph})", "list"),
@@ -59,6 +107,9 @@ _ORDER_FILTERS: dict[str, tuple[str, str]] = {
     "revtype2":         ("oh.ord_revtype2 IN ({ph})", "list"),
     "revtype3":         ("oh.ord_revtype3 IN ({ph})", "list"),
     "revtype4":         ("oh.ord_revtype4 IN ({ph})", "list"),
+    # Code or name. Legacy load-class codes never match an agent.
+    "booking_company":  _label_filter("oh.ord_revtype1", "RevType1"),
+    "booking_agent":    _label_filter("oh.ord_revtype4", "RevType4", _REVTYPE4_LEGACY_SQL),
     "origin_company":   ("oh.ord_originpoint IN ({ph})", "list"),
     "dest_company":     ("oh.ord_destpoint IN ({ph})", "list"),
     "origin_city":      ("oh.ord_origincity IN ({ph})", "list"),
@@ -81,6 +132,10 @@ _ORDER_GROUPS: dict[str, tuple[str, str | None]] = {
     "revtype2":       ("oh.ord_revtype2", None),
     "revtype3":       ("oh.ord_revtype3", None),
     "revtype4":       ("oh.ord_revtype4", None),
+    "booking_company": ("oh.ord_revtype1", "bc.name"),
+    # Legacy load-class orders collapse into one NULL group rather than
+    # appearing as agents named Legal, Van and so on.
+    "booking_agent":  (_BOOKING_AGENT, _BOOKING_AGENT_NAME),
     "status":         ("oh.ord_status", None),
     "invoice_status": ("oh.ord_invoicestatus", None),
     "billto":         ("oh.ord_billto", "b.cmp_name"),
@@ -241,6 +296,10 @@ _ORDER_FROM = """
     LEFT JOIN company b   ON b.cmp_id = oh.ord_billto
     LEFT JOIN company sh  ON sh.cmp_id = oh.ord_shipper
     LEFT JOIN company cn  ON cn.cmp_id = oh.ord_consignee
+    LEFT JOIN labelfile bc ON bc.abbr = oh.ord_revtype1
+        AND bc.labeldefinition = 'RevType1'
+    LEFT JOIN labelfile ba ON ba.abbr = oh.ord_revtype4
+        AND ba.labeldefinition = 'RevType4'
 """
 
 
@@ -995,6 +1054,67 @@ class TmwDB:
             for row in cursor.fetchall()
         ]
 
+    def _list_labels(
+        self, column: str, definition: str, key: str,
+        exclude: str | None, include_retired: bool,
+    ) -> list[dict]:
+        """Every labelfile code under `definition`, with its order activity.
+
+        UNK is always left out - it means "not recorded", not a value. Retired
+        codes are kept by default because their orders remain in the history.
+        `column` is a hardcoded orderheader column, never caller input.
+        """
+        if not self.conn:
+            self.connect()
+
+        clauses = ["lf.labeldefinition = ?", "lf.abbr <> 'UNK'"]
+        if exclude:
+            clauses.append(f"lf.abbr NOT IN ({exclude})")
+        if not include_retired:
+            clauses.append("COALESCE(lf.retired, 'N') <> 'Y'")
+
+        cursor = self.conn.cursor()
+        cursor.execute(f"""
+            SELECT
+                lf.abbr,
+                lf.name,
+                lf.retired,
+                COUNT(oh.ord_hdrnumber),
+                -- 1950-01-01 is TMW's unknown-date placeholder, not an order.
+                MIN(CASE WHEN oh.ord_startdate > '1950-01-02' THEN oh.ord_startdate END),
+                MAX(oh.ord_startdate)
+            FROM labelfile lf
+            LEFT JOIN orderheader oh ON oh.{column} = lf.abbr
+            WHERE {" AND ".join(clauses)}
+            GROUP BY lf.abbr, lf.name, lf.retired, lf.code
+            ORDER BY lf.code
+        """, [definition])
+
+        return [
+            {
+                key: row[0],
+                "name": row[1],
+                "retired": row[2] == "Y",
+                "order_count": row[3],
+                "first_order": str(row[4]) if row[4] else None,
+                "last_order": str(row[5]) if row[5] else None,
+            }
+            for row in cursor.fetchall()
+        ]
+
+    def list_booking_agents(self, include_retired: bool = True) -> list[dict]:
+        """Booking agents (RevType4), excluding the legacy load-class codes."""
+        return self._list_labels(
+            "ord_revtype4", "RevType4", "booking_agent",
+            _REVTYPE4_LEGACY_SQL, include_retired,
+        )
+
+    def list_booking_companies(self, include_retired: bool = True) -> list[dict]:
+        """Booking sub-companies (RevType1)."""
+        return self._list_labels(
+            "ord_revtype1", "RevType1", "booking_company", None, include_retired,
+        )
+
     _DRIVER_SELECT = """
         m.mpp_id,
         m.mpp_lastfirst,
@@ -1161,10 +1281,17 @@ class TmwDB:
                 oh.ord_totalcharge,
                 oh.ord_currency,
                 {_CURRENCY_NORM},
-                oh.mov_number
+                oh.mov_number,
+                oh.ord_revtype3,
+                oh.ord_revtype4,
+                {_BOOKING_AGENT},
+                {_BOOKING_AGENT_NAME},
+                bc.name
             {_ORDER_FROM}
             WHERE {where}
-            ORDER BY oh.ord_startdate DESC
+            -- ord_hdrnumber breaks ties: orders can share a start time, and
+            -- without it which rows land inside TOP could vary between calls.
+            ORDER BY oh.ord_startdate DESC, oh.ord_hdrnumber DESC
         """, [limit + 1, *params])
 
         rows = cursor.fetchall()
@@ -1184,7 +1311,15 @@ class TmwDB:
                     "consignee": row[8],
                     "consignee_name": row[9],
                     "revtype1": row[10],
+                    # revtype1 decoded: the sub-company that booked the load.
+                    "booking_company_name": row[26],
                     "revtype2": row[11],
+                    "revtype3": row[22],
+                    "revtype4": row[23],
+                    # revtype4 decoded. NULL where the order predates the
+                    # field's use for agents and holds a load class instead.
+                    "booking_agent": row[24],
+                    "booking_agent_name": row[25],
                     "start_date": str(row[12]) if row[12] else None,
                     "completion_date": str(row[13]) if row[13] else None,
                     "origin": row[14],
