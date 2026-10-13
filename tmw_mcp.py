@@ -336,9 +336,11 @@ def search_stops(
     loads that started in Illinois.
 
     drivers matches either seat, so a team driver's stops are found whichever
-    seat they held. reference_numbers searches customer paperwork - pair it with
-    reference_types, where the common types are 'B/L #', 'LOAD #', 'P/U #',
-    'REF' and 'CUSBRK'.
+    seat they held. reference_numbers matches only each stop's PRIMARY
+    reference - about half of what is filed, and nothing attached to the order
+    itself - so to find a load by a reference number, use
+    search_reference_numbers instead. Pair this one with reference_types, where
+    the common types are 'B/L #', 'LOAD #', 'P/U #', 'REF' and 'CUSBRK'.
 
     Two filters cannot use an index and scan 1.6M rows if used alone - trailers
     and late_arrival. Pair either with a date or status filter.
@@ -410,6 +412,102 @@ def search_stops(
         dest_state=dest_state,
         min_charge=min_charge,
         currency=currency,
+    )
+
+
+@mcp.tool()
+def search_reference_numbers(
+    reference_numbers: list[str] | None = None,
+    reference_contains: str | None = None,
+    reference_types: list[str] | None = None,
+    attached_to: list[str] | None = None,
+    orders: list[int] | None = None,
+    order_numbers: list[str] | None = None,
+    updated_after: str | None = None,
+    updated_before: str | None = None,
+    billto: list[str] | None = None,
+    shipper: list[str] | None = None,
+    consignee: list[str] | None = None,
+    status: list[str] | None = None,
+    booking_company: list[str] | None = None,
+    booking_agent: list[str] | None = None,
+    revtype1: list[str] | None = None,
+    revtype2: list[str] | None = None,
+    started_after: str | None = None,
+    started_before: str | None = None,
+    completed_after: str | None = None,
+    completed_before: str | None = None,
+    origin_state: list[str] | None = None,
+    dest_state: list[str] | None = None,
+    limit: int = 200,
+) -> dict:
+    """Find reference numbers (B/L, PO, PAPS, seal, load #, ...) and what they belong to.
+
+    This is the place to look up ANY reference number. An order's paperwork is
+    filed across several owners — a B/L # on the order itself, a seal or
+    appointment on a stop, a PAPS or ACE number on a freight line, a copy on
+    the invoice line — and this searches all of them. search_stops'
+    reference_numbers only sees each stop's primary reference, about half of
+    what is filed, and nothing attached to the order itself.
+
+    Three ways in, combinable with each other and with every order filter:
+      a number you have   -> reference_numbers=["C702280"]   (exact, instant)
+      part of a number    -> reference_contains="702280"     (substring)
+      everything on order -> orders=[364706] or order_numbers=["364706"]
+    Narrow with reference_types, e.g. ["B/L #"], ["P/O #"], ["PAPS"], and with
+    attached_to, any of "order", "stop", "freight", "invoice". At least one
+    filter is required. Matching is case-insensitive. Prefer reference_contains
+    when an exact number finds nothing: customers format numbers loosely, and a
+    few stored numbers carry leading spaces an exact match cannot see.
+
+    Each result says what the reference is attached_to and carries its
+    context: the order (ord_number, billto, booking_company, start date), the
+    stop it sits on (stop_event, company, city, arrival, mov_number,
+    lgh_number) — directly, or through its freight or invoice line — and the
+    freight line (fgt_number, commodity) or invoice line (ivd_number, item).
+    reference_type_name decodes the type where TMW has a label; EDI-loaded
+    types such as CR, CON, TEL, ST# and OID have none.
+
+    The same number often appears more than once — on the order, its stop,
+    and the invoice line that billed it. Those are copies, not separate loads;
+    the attached_to field tells them apart.
+
+    A null ord_hdrnumber means the reference sits on an empty-move stop of a
+    trip (DLT, DMT, RTP, BMT) rather than on an order; mov_number still places
+    it on the trip.
+
+    Fuel card numbers and money codes are never returned.
+
+    Results are selected NEWEST FIRST, so when truncated is true the most
+    recently entered references are the ones returned. They are then grouped by
+    order, newest order first, with order-level references ahead of stop,
+    freight and invoice ones. Returns {"references": [...], "count": n,
+    "truncated": bool}.
+    """
+    return db.search_reference_numbers(
+        limit=limit,
+        reference_numbers=reference_numbers,
+        reference_contains=reference_contains,
+        reference_types=reference_types,
+        attached_to=attached_to,
+        orders=orders,
+        order_numbers=order_numbers,
+        updated_after=updated_after,
+        updated_before=updated_before,
+        billto=billto,
+        shipper=shipper,
+        consignee=consignee,
+        status=status,
+        booking_company=booking_company,
+        booking_agent=booking_agent,
+        revtype1=revtype1,
+        revtype2=revtype2,
+        started_after=started_after,
+        started_before=started_before,
+        completed_after=completed_after,
+        completed_before=completed_before,
+        origin_state=origin_state,
+        dest_state=dest_state,
     )
 
 

@@ -216,6 +216,23 @@ Connection is lazy and **thread-local** — `TmwDB` connects on the first query 
 thread and reuses that thread's connection. `db.close()` closes only the calling thread's.
 Build it with `TmwDB.from_settings(load_settings())`.
 
+`connect()` calls `setencoding(locale.getencoding())` so `str` parameters bind
+as **varchar**. pyodbc's default is nvarchar, and comparing a varchar column to
+an nvarchar parameter under this database's SQL collation converts the column
+on every row and rules out a seek. That one line took stops-by-truck from 84ms
+to 5ms, stops-by-company from 275ms to 4ms, and an exact reference lookup from
+240ms to 1ms, with identical results across every tool.
+
+The encoding is **per platform, not hardcoded**: the driver reads narrow
+character data in its own assumed encoding — the ANSI code page (cp1252) for
+Native Client on Windows, the process locale (UTF-8 in `python:slim`) for
+msodbcsql18 on Linux — and converts to the server code page from there.
+Hardcoding cp1252 would mangle non-ASCII input in the container, e.g. the en
+dash in reference `126 – 4517115 /179-5929935`. `locale.getencoding()` gives
+the right answer on both and ignores Python's UTF-8 mode, which would otherwise
+report UTF-8 on Windows. ASCII is identical either way, so a mismatch here
+shows up only on accented or typographic characters.
+
 Per-thread is not optional: `pyodbc.threadsafety` is 1, so a connection cannot be shared
 between threads, and the HTTP transport dispatches sync tool functions to a thread pool
 (`anyio.to_thread.run_sync`). A single shared connection survives stdio only because one
@@ -304,6 +321,7 @@ filters compose.
 | `get_order_freight` | `orders`, `stop_type` | Freight lines per order; DRP (delivery) copies by default |
 | `summarize_order_freight` | `orders` | Per-order freight totals, with PUP vs DRP `in_sync` flag |
 | `search_freight` | freight + order filters | Freight by commodity, weight, temperature, dimensions |
+| `search_reference_numbers` | ref + order filters | Every reference number on orders, stops, freight and invoice lines, with its owner |
 
 ## Database Layer (`tmw_db.py`)
 
@@ -555,6 +573,55 @@ separately.
 Note the 16,969 `UNK` orders are not a rounding error: they carry 13.1M in
 charges across the 2024-onward window alone. Do not assume they are either
 currency.
+
+### Reference Numbers
+
+`referencenumber` (1.2M rows) is polymorphic: `ref_table` names the owner and
+`ref_tablekey` its key, with `ord_hdrnumber` carried alongside. One order's
+paperwork is spread across owners: B/L # on the order, seals and contacts on
+stops, PAPS/ACE numbers on freight lines, and copies on invoice lines.
+`search_reference_numbers` is the only place to see all of it together.
+
+| `ref_table` | Rows | Exposed as | Owner key |
+|---|---|---|---|
+| `stops` | 562k | `stop` | `stp_number` |
+| `orderheader` | 529k | `order` | `ord_hdrnumber` |
+| `invoicedetail` | 72k | `invoice` | `ivd_number` (90% name a `stp_number`) |
+| `freightdetail` | 47k | `freight` | `fgt_number` → its stop |
+| `paydetail`, `fuelcardrequestlog`, `legheader`, `invoiceheader` | 2.8k | **not exposed** | no order, newest 2023 |
+
+**"Every reference has an order" is 99% true.** Of the four exposed owners,
+12.4k rows carry `ord_hdrnumber = 0`, almost all on stops. Those sit on
+empty-move stops (`DLT`, `DMT`, `RTP`, `BMT`), such as a B/L on a drop, so they are
+returned with a NULL order and their `mov_number` / `lgh_number`. Where the
+ref's order disagrees with its owner's, it is 0.02% (113 stops, 6 freight, 87
+invoice lines), and the ref's own value is reported.
+
+**`stops.stp_refnum` is only the primary reference.** It matches 293k of the
+562k stop references, and order-level references are never on a stop, so
+`search_stops(reference_numbers=...)` misses about half. Its docstring points
+callers to `search_reference_numbers`.
+
+**Excluded on purpose:** every `TCH*` type (TCH fuel card numbers, card IDs
+and money codes, which are spendable credentials, including three money codes
+filed against orders) and 15.5k blank numbers. The excluded owner tables also
+hold driver pay notes.
+
+Matching: `reference_numbers` is exact and seeks `sk_ref_num` (1ms).
+The caller's values are stripped, but SQL Server ignores only *trailing*
+spaces, and 1,367 stored numbers have leading ones (mostly free text such as
+`' 525 piglets'`). `reference_contains` is a substring `LIKE`, about 0.6s
+because no index serves a leading wildcard. It catches those and loosely
+formatted numbers. 63 reference types are in `labelfile` `ReferenceNumbers`;
+the EDI-loaded ones (`CR`, `CON`, `TEL`, `ST#`, `OID`, `NSH`, ...) are not, so
+`reference_type_name` is NULL for them.
+
+Selection is **newest first by `ref_id`**, the clustered key, so a truncated
+result keeps the most recently entered references, and a broad filter stops
+after a short backward scan. Presentation groups results by order, newest
+first, then order → stop → freight → invoice. It uses the same deferred join as
+stops and freight. The same number often appears on the order, its stop and
+the invoice line; these are copies, and `attached_to` separates them.
 
 ### Freight Detail
 

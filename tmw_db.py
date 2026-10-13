@@ -1,3 +1,4 @@
+import locale
 import threading
 from datetime import datetime
 
@@ -512,6 +513,90 @@ _STOP_ORDER = """
 """
 
 
+# --- Reference number search ------------------------------------------------
+#
+# referencenumber (1.2M rows) is polymorphic: ref_table names the owning table
+# and ref_tablekey its key, with ord_hdrnumber carried alongside. A single
+# order spreads its paperwork across several owners - a B/L # on the order, a
+# seal on a stop, a PAPS number on a freight line - so this is the only place
+# every reference for an order can be seen together.
+#
+# The stop's own stp_refnum holds just its PRIMARY reference: 293k of the 562k
+# stop references match it, and none of the 529k order-level ones are on a
+# stop at all. search_stops(reference_numbers=...) therefore misses about half
+# of what is filed; this search does not.
+#
+# Only the four order-related owners are exposed. paydetail,
+# fuelcardrequestlog, legheader and invoiceheader rows carry no order, the
+# newest dates from 2023, and they hold driver pay notes and fuel card numbers.
+# TCH* types (TCH card numbers, card IDs and money codes - spendable fuel card
+# credentials) are excluded wherever they are attached, including the three
+# money codes filed against orders.
+_REFERENCE_OWNERS = {
+    "order": "orderheader",
+    "stop": "stops",
+    "freight": "freightdetail",
+    "invoice": "invoicedetail",
+}
+_REFERENCE_OWNER_OF = {table: name for name, table in _REFERENCE_OWNERS.items()}
+_REFERENCE_SCOPE = (
+    "r.ref_table IN ('orderheader', 'stops', 'freightdetail', 'invoicedetail')"
+    " AND r.ref_type NOT LIKE 'TCH%'"
+    # 15.5k rows hold a blank or whitespace-only number - no information.
+    " AND LTRIM(RTRIM(r.ref_number)) <> ''"
+)
+
+_REFERENCE_FILTERS: dict[str, tuple[str, str]] = {
+    # Exact match seeks sk_ref_num (ref_number, ref_type) in ~2ms. The caller's
+    # values are stripped first; SQL Server ignores trailing spaces but not
+    # leading ones, and 1,367 stored numbers carry leading spaces - use
+    # reference_contains to find those.
+    "reference_numbers":  ("r.ref_number IN ({ph})", "list"),
+    # Substring match. No index serves a leading wildcard, but the scan of the
+    # narrow index is ~240ms across all 1.2M rows, so it is allowed alone.
+    "reference_contains": ("r.ref_number LIKE ? ESCAPE '\\'", "scalar"),
+    "reference_types":    ("r.ref_type IN ({ph})", "list"),
+    # Translated from order/stop/freight/invoice to table names by the method.
+    "attached_to":        ("r.ref_table IN ({ph})", "list"),
+    # Overrides the order filter of the same name: r.ord_hdrnumber seeks
+    # dk_ord_hdrnumber directly instead of going through the join.
+    "orders":             ("r.ord_hdrnumber IN ({ph})", "list"),
+    "updated_after":      ("r.last_updatedate >= ?", "date"),
+    "updated_before":     ("r.last_updatedate < ?", "date"),
+}
+
+# Narrow FROM for the key-picking half. orderheader is joined only so order
+# filters (billto, booking_company, started_after, ...) can apply; with none
+# supplied the optimiser drops the join, since ord_hdrnumber is its key.
+_REFERENCE_FILTER_FROM = """
+    FROM referencenumber r
+    LEFT JOIN orderheader oh ON oh.ord_hdrnumber = r.ord_hdrnumber
+"""
+
+# Wide half. Each owner resolves to a stop where it has one: a stop reference
+# is the stop, a freight line sits on a stop, and 90% of invoice lines name
+# the stop they bill for. That gives every row its trip context.
+_REFERENCE_OUTPUT_JOINS = """
+    LEFT JOIN orderheader oh  ON oh.ord_hdrnumber = r.ord_hdrnumber
+    LEFT JOIN company b       ON b.cmp_id = oh.ord_billto
+    LEFT JOIN labelfile bc    ON bc.abbr = oh.ord_revtype1
+        AND bc.labeldefinition = 'RevType1'
+    LEFT JOIN labelfile rt    ON rt.abbr = r.ref_type
+        AND rt.labeldefinition = 'ReferenceNumbers'
+    LEFT JOIN freightdetail f ON r.ref_table = 'freightdetail'
+        AND f.fgt_number = r.ref_tablekey
+    LEFT JOIN invoicedetail i ON r.ref_table = 'invoicedetail'
+        AND i.ivd_number = r.ref_tablekey
+    LEFT JOIN stops s         ON s.stp_number = CASE r.ref_table
+        WHEN 'stops' THEN r.ref_tablekey
+        WHEN 'freightdetail' THEN f.stp_number
+        WHEN 'invoicedetail' THEN NULLIF(i.stp_number, 0)
+    END
+    LEFT JOIN company c       ON c.cmp_id = s.cmp_id
+    LEFT JOIN city cty        ON cty.cty_code = s.stp_city
+"""
+
+
 def _coerce_date(value):
     if isinstance(value, datetime):
         return value
@@ -663,6 +748,22 @@ class TmwDB:
             conn_str += f"TrustServerCertificate={self.trust_server_certificate};"
 
         self.conn = pyodbc.connect(conn_str, timeout=self.timeout)
+        # Bind str parameters as varchar, not pyodbc's default nvarchar. The
+        # TMW columns are varchar under a SQL collation, where comparing one to
+        # an nvarchar parameter converts the COLUMN on every row and cannot
+        # seek: an exact reference number lookup took 240ms instead of 1ms,
+        # and a substring search 2.7s instead of 0.6s.
+        #
+        # The bytes must be in the encoding the DRIVER assumes for narrow
+        # character data, which differs by platform: Native Client on Windows
+        # uses the ANSI code page (cp1252 here), while msodbcsql18 on Linux
+        # uses the process locale (UTF-8 in the python:slim image). Either way
+        # the driver then converts to the server's code page. A hardcoded
+        # cp1252 would send 'é' as 0xE9, which the Linux driver reads as broken
+        # UTF-8. locale.getencoding() reports the right one on both, and,
+        # unlike getpreferredencoding(), is not overridden by Python's UTF-8
+        # mode.
+        self.conn.setencoding(encoding=locale.getencoding())
 
     def close(self):
         """Close this thread's connection. Other threads keep theirs."""
@@ -927,6 +1028,154 @@ class TmwDB:
             "movements": len({r[1] for r in rows[:limit]}),
             "truncated": truncated,
             "scope": scope,
+        }
+
+    def search_reference_numbers(self, limit: int | None = None, **filters) -> dict:
+        """Search every reference filed against orders, stops, freight and invoices.
+
+        Each row says what the reference is attached to and carries that
+        owner's context: the order, the stop (event, company, city, arrival,
+        movement, leg), the freight line, or the invoice line.
+
+        Selection is newest-first by ref_id, so `limit` keeps the most recently
+        entered references. Presentation groups them by order, newest order
+        first, then order-level references before stop, freight and invoice
+        ones.
+
+        Accepts every order filter too, so "B/L numbers on this customer's
+        loads last week" is one query.
+        """
+        if not self.conn:
+            self.connect()
+
+        if filters.get("reference_numbers") is not None:
+            values = filters["reference_numbers"]
+            values = [values] if isinstance(values, str) else values
+            filters["reference_numbers"] = [str(v).strip() for v in values]
+        if filters.get("reference_contains") is not None:
+            term = str(filters["reference_contains"]).strip()
+            filters["reference_contains"] = _like_term(term) if term else None
+        if filters.get("attached_to") is not None:
+            owners = filters["attached_to"]
+            owners = [owners] if isinstance(owners, str) else owners
+            tables = []
+            for owner in owners:
+                table = _REFERENCE_OWNERS.get(str(owner).strip().lower())
+                if table is None:
+                    valid = ", ".join(_REFERENCE_OWNERS)
+                    raise ValueError(f"attached_to must be among {valid}, got {owner!r}")
+                tables.append(table)
+            filters["attached_to"] = tables
+
+        limit = min(limit or self.max_search_rows, self.max_search_rows)
+        merged = {**_ORDER_FILTERS, **_REFERENCE_FILTERS}
+        where, params = _build_where(filters, merged)
+
+        # Deferred join, as in search_stops and search_freight: pick ref_ids
+        # with a narrow projection, newest first - ref_id is the clustered key,
+        # so this is a backward scan the row goal can stop early - then widen.
+        cursor = self.conn.cursor()
+        cursor.execute(f"""
+            WITH picked AS (
+                SELECT TOP (?) r.ref_id
+                {_REFERENCE_FILTER_FROM}
+                WHERE {_REFERENCE_SCOPE} AND ({where})
+                ORDER BY r.ref_id DESC
+            )
+            SELECT
+                r.ref_id,
+                r.ref_type,
+                rt.name,
+                r.ref_number,
+                r.ref_sequence,
+                r.ref_table,
+                r.ref_tablekey,
+                r.ord_hdrnumber,
+                oh.ord_number,
+                oh.ord_status,
+                oh.ord_billto,
+                b.cmp_name,
+                oh.ord_revtype1,
+                bc.name,
+                oh.ord_startdate,
+                r.last_updatedate,
+                s.stp_number,
+                s.stp_event,
+                s.stp_type,
+                s.cmp_id,
+                c.cmp_name,
+                cty.cty_nmstct,
+                s.stp_arrivaldate,
+                s.mov_number,
+                s.lgh_number,
+                f.fgt_number,
+                f.cmd_code,
+                f.fgt_description,
+                i.ivd_number,
+                i.cht_itemcode,
+                i.ivd_description
+            FROM picked
+            JOIN referencenumber r ON r.ref_id = picked.ref_id
+            {_REFERENCE_OUTPUT_JOINS}
+            ORDER BY
+                r.ord_hdrnumber DESC,
+                CASE r.ref_table WHEN 'orderheader' THEN 0 WHEN 'stops' THEN 1
+                                 WHEN 'freightdetail' THEN 2 ELSE 3 END,
+                s.stp_arrivaldate,
+                r.ref_tablekey,
+                r.ref_sequence,
+                r.ref_id
+        """, [limit + 1, *params])
+
+        rows = cursor.fetchall()
+        return {
+            "references": [self._reference_row_to_dict(r) for r in rows[:limit]],
+            "count": min(len(rows), limit),
+            "truncated": len(rows) > limit,
+        }
+
+    @staticmethod
+    def _reference_row_to_dict(row) -> dict:
+        def text(value):
+            return value.strip() if isinstance(value, str) and value.strip() else None
+
+        return {
+            "ref_id": row[0],
+            "reference_type": text(row[1]),
+            # NULL for the EDI-loaded types (CR, CON, TEL, ST#, OID, ...),
+            # which have no ReferenceNumbers label.
+            "reference_type_name": text(row[2]),
+            "reference_number": text(row[3]),
+            "sequence": row[4],
+            "attached_to": _REFERENCE_OWNER_OF.get(row[5], row[5]),
+            # ord_hdrnumber 0 is not an order: those references sit on the
+            # empty-move stops (DLT, DMT, RTP, BMT) of a trip.
+            "ord_hdrnumber": row[7] or None,
+            "ord_number": text(row[8]),
+            "order_status": row[9],
+            "billto": text(row[10]),
+            "billto_name": row[11],
+            "booking_company": text(row[12]),
+            "booking_company_name": row[13],
+            "order_start_date": str(row[14]) if row[14] else None,
+            "updated": str(row[15]) if row[15] else None,
+            # The stop the reference belongs to, directly or through its
+            # freight or invoice line.
+            "stp_number": row[16],
+            "stop_event": text(row[17]),
+            "stop_type": text(row[18]),
+            "stop_company": text(row[19]),
+            "stop_company_name": row[20],
+            "stop_city": row[21],
+            "stop_arrival": str(row[22]) if row[22] else None,
+            "mov_number": row[23],
+            "lgh_number": row[24],
+            "fgt_number": row[25],
+            "commodity": text(row[26]),
+            "freight_description": text(row[27]),
+            "ivd_number": row[28],
+            "invoice_item": text(row[29]),
+            "invoice_description": text(row[30]),
         }
 
     def get_active_power(self) -> list[dict]:
