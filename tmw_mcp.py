@@ -91,11 +91,18 @@ movement begins with an XDL (Cross-Dock Load).
 - `stp_departure_status = 'DNE'`: the driver has departed the stop.
 - Arrival/departure dates reflect actual times if the driver has been there, or expected times if not yet.
 
-## Leg / Movement Statuses
+## Leg Statuses (`lgh_outstatus`)
 - `AVL` — Available (unassigned)
 - `PLN` — Planned (assigned, not yet started)
+- `DSP` — Dispatched
 - `STD` — Started (in progress)
-- `DNE` — Done (completed)
+- `CMP` — Completed
+- `CAN` — Cancelled
+`DNE` is a STOP status (arrived / departed), never a leg status.
+
+## Mileage
+Use `search_legs` for miles. It sums each leg's stops into total, loaded, empty and bobtail miles
+(bobtail = tractor with no trailer), and returns `totals` across every matching leg.
 
 ## Revenue Types on Orders
 The four `revtype` fields are customer-defined classifications. Codes are truncated to six characters.
@@ -121,12 +128,110 @@ def truck_location(trucks: list[str]) -> list[dict]:
 
 
 @mcp.tool()
-def get_active_legs() -> list[dict]:
-    """Get all active legs in the system with status Available (AVL), Planned (PLN), or Started (STD).
-    Includes tractor, trailer, carrier, start/end city, mileage, and a comma-separated list of associated orders.
-    Results are large — always filter via Python before returning to context.
+def search_legs(
+    active_only: bool = False,
+    leg_status: list[str] | None = None,
+    legs: list[int] | None = None,
+    movements: list[int] | None = None,
+    trucks: list[str] | None = None,
+    trailers: list[str] | None = None,
+    carriers: list[str] | None = None,
+    drivers: list[str] | None = None,
+    booking_company: list[str] | None = None,
+    trip_types: list[str] | None = None,
+    started_after: str | None = None,
+    started_before: str | None = None,
+    ended_after: str | None = None,
+    ended_before: str | None = None,
+    start_companies: list[str] | None = None,
+    end_companies: list[str] | None = None,
+    start_cities: list[int] | None = None,
+    end_cities: list[int] | None = None,
+    start_states: list[str] | None = None,
+    end_states: list[str] | None = None,
+    orders: list[int] | None = None,
+    order_numbers: list[str] | None = None,
+    billto: list[str] | None = None,
+    shipper: list[str] | None = None,
+    consignee: list[str] | None = None,
+    booking_agent: list[str] | None = None,
+    limit: int = 200,
+) -> dict:
+    """Search legs and get their mileage — total, loaded, empty and bobtail.
+
+    The tool for any mileage question: "how many empty miles did truck 101 run
+    last month", "loaded percentage for this driver", "what's active right
+    now". At least one filter is required. Dates are ISO strings and the
+    *_before bounds are exclusive.
+
+    MILES ARE SUMMED FROM THE STOPS, not taken from the leg header. Each stop
+    records the distance driven to it and whether the truck was loaded on the
+    way, so every leg splits into loaded_miles, empty_miles and bobtail_miles
+    (tractor with no trailer — neither loaded nor pulling an empty, so report
+    it separately rather than folding it into either), plus a small
+    unclassified remainder. loaded_pct is loaded / total.
+    header_miles is the leg header's own figure and miles_match says whether it
+    agrees; they differ on about 12% of legs, usually with the stops higher.
+    Report `miles`.
+
+    TOTALS. `totals` sums every matching leg, not just the ones returned, so
+    use it for any aggregate — it stays correct when truncated is true. Rows
+    come back newest start date first.
+
+    STATUS. active_only=True gives every leg still in play (AVL, PLN, DSP,
+    STD) — this replaces the old get_active_legs. leg_status takes the codes
+    directly: AVL available, PLN planned, DSP dispatched, STD started, CMP
+    completed, CAN cancelled. Completed is CMP, not DNE. Most AVL legs are
+    unassigned loads with no truck yet, and a handful are years old.
+
+    WHO AND WHAT. trucks, trailers (primary trailer) and carriers are the IDs
+    on the leg. drivers matches either seat. booking_company takes the code or
+    the name (EPT / "Earl Paddock Transpo"). trip_types is the leg's Trip Type,
+    code or name: LOCAL, REG (Deck), REEF (Reefer), LIVEST (Livestock), VAN,
+    OD, DRA, DRB and others; each row carries trip_type_name.
+
+    WHERE. start_/end_companies are cmp_id facility codes, start_/end_cities
+    numeric codes from find_city_codes, start_/end_states two-letter codes.
+
+    ORDERS. orders, order_numbers, billto, shipper, consignee and
+    booking_agent match legs that carry a stop of a matching order. A leg can
+    carry several orders and an order can span several legs, so each row lists
+    every order on it in `orders`. Miles on a shared leg are the leg's, not
+    one order's share.
+
+    Returns {"legs": [...], "count": n, "truncated": bool, "totals": {...}}.
+    limit can go up to 1000. Use search_stops(legs=[...]) to see the stops
+    behind a leg's miles.
     """
-    return db.get_active_legs()
+    return db.search_legs(
+        limit=limit,
+        active_only=active_only,
+        leg_status=leg_status,
+        legs=legs,
+        movements=movements,
+        trucks=trucks,
+        trailers=trailers,
+        carriers=carriers,
+        drivers=drivers,
+        booking_company=booking_company,
+        trip_types=trip_types,
+        started_after=started_after,
+        started_before=started_before,
+        ended_after=ended_after,
+        ended_before=ended_before,
+        start_companies=start_companies,
+        end_companies=end_companies,
+        start_cities=start_cities,
+        end_cities=end_cities,
+        start_states=start_states,
+        end_states=end_states,
+        orders=orders,
+        order_numbers=order_numbers,
+        billto=billto,
+        shipper=shipper,
+        consignee=consignee,
+        booking_agent=booking_agent,
+    )
 
 
 @mcp.tool()

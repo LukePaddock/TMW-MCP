@@ -295,12 +295,15 @@ compose.yml.example     Container config template (copy to compose.yml)
 | `truck_location` | `trucks: list[str]` | Latest GPS check call per truck |
 | `truck_plan` | `trucks: list[str]` | Active (PLN/STD) stop sequences per truck |
 | `get_active_power` | _(none)_ | Active tractors with current driver and team leader |
-| `get_active_legs` | _(none)_ | All active legs (AVL/PLN/STD) fleet-wide |
+| `search_legs` | many optional filters | Legs with total, loaded, empty and bobtail miles summed from their stops |
 | `search_stops` | `scope` + many optional filters | Stops by identity, status, date, appointment, location, driver, truck |
 | `search_drivers` | `name` + many optional filters | Drivers by code, name, status, assignment, licence |
 | `search_orders` | many optional filters | Orders by date, customer, location, revenue type |
 | `summarize_orders` | `group_by` + same filters | Aggregated order totals, split by currency |
 | `find_city_codes` | `name`, `state` | Resolve a city name to the numeric codes orders store |
+| `list_booking_agents` | `include_retired` | Booking agents (revtype4) with order counts |
+| `list_booking_companies` | `include_retired` | Booking sub-companies (revtype1) with order counts |
+| `search_reference_numbers` | ref + order filters | Any reference number on orders, stops, freight or invoice lines, with its owner |
 | `get_order_freight` | `orders`, `stop_type` | Freight lines per order; DRP (delivery) copies by default |
 | `summarize_order_freight` | `orders` | Per-order freight totals, with PUP vs DRP `in_sync` flag |
 | `search_freight` | freight + order filters | Freight by commodity, weight, temperature, dimensions |
@@ -368,6 +371,24 @@ complete one.
 
 Order origin and destination cities are stored as integer codes, so resolve a
 name with `find_city_codes` first.
+
+### Legs and mileage
+
+`search_legs` replaces `get_active_legs`; `active_only=True` returns the same
+set (AVL, PLN, DSP, STD). It filters by status, truck, trailer, carrier,
+driver (either seat), booking company, trip type, start and end dates and
+places, and by order fields — `orders`, `billto`, `booking_agent` and so on
+match legs carrying a stop of a matching order.
+
+Miles are **summed from the stops**, not read from the leg header. Each stop
+records the distance driven to it and whether the truck was loaded on the way,
+so every leg splits into `loaded_miles`, `empty_miles` and `bobtail_miles`
+(tractor with no trailer), with `loaded_pct`. `header_miles` and `miles_match`
+show the header's own figure, which disagrees on about 12% of legs. `totals`
+covers every matching leg, so aggregates stay correct when the row list is
+truncated.
+
+Completed legs are `CMP`, not `DNE` — `DNE` is a stop status.
 
 ### Freight
 

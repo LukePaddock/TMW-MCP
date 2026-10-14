@@ -253,12 +253,21 @@ Understanding the hierarchy is essential for interpreting query results correctl
 
 ### Status Codes
 
-| Code | Meaning |
-|------|---------|
-| AVL  | Available — unassigned |
-| PLN  | Planned — assigned, not yet started |
-| STD  | Started — in progress |
-| DNE  | Done — completed |
+Leg status (`lgh_outstatus`), counts across all 475k legs:
+
+| Code | Meaning | Legs |
+|------|---------|------|
+| AVL  | Available — unassigned | 334 |
+| PLN  | Planned — assigned, not yet started | 82 |
+| DSP  | Dispatched | 1 |
+| STD  | Started — in progress | 81 |
+| CMP  | Completed | 474,512 |
+| CAN  | Cancelled | 564 |
+
+**Completed legs are `CMP`, not `DNE`.** An earlier version of this table and
+of the server instructions said `DNE`, which matches no leg at all; `DNE` is a
+*stop* status (below). Of the 334 AVL legs, 316 are 2026 loads not yet given a
+truck and 18 are stale, back to 2004.
 
 Orders use a different set on `ord_status` — `CMP` (completed), `CAN` (cancelled),
 `QTE` (quote), `PND`, `ICO`, `MST`, alongside `AVL` / `PLN` / `STD`. Don't assume the
@@ -310,7 +319,7 @@ filters compose.
 | `truck_location` | `trucks: list[str]` | Latest GPS check-call per truck (`TMW_CHECKCALL_LOOKBACK_DAYS` window) |
 | `truck_plan` | `trucks: list[str]` | Active (PLN/STD) stop sequences for trucks, sorted by truck then trip order |
 | `get_active_power` | _(none)_ | All active tractors with current driver and team leader |
-| `get_active_legs` | _(none)_ | All active legs (AVL/PLN/STD) fleet-wide — can be large, filter in Python |
+| `search_legs` | many optional filters | Legs with total / loaded / empty / bobtail miles from their stops, plus `totals`; `active_only` replaces `get_active_legs` |
 | `search_stops` | `scope` + many optional filters | Stops by identity, status, date, appointment, location, driver, truck - see below |
 | `search_drivers` | `name` + many optional filters | Drivers by code, name, status, assignment, licence - see below |
 | `search_orders` | many optional filters | Orders by date, customer, location, revenue type — see below |
@@ -573,6 +582,69 @@ separately.
 Note the 16,969 `UNK` orders are not a rounding error: they carry 13.1M in
 charges across the 2024-onward window alone. Do not assume they are either
 currency.
+
+### Leg Search and Mileage
+
+`search_legs` replaced `get_active_legs`, which returned every AVL/PLN/STD leg
+unfiltered and missed `DSP`. `active_only=True` returns the same set plus DSP,
+which is 498 legs, and `_LEG_MAX_ROWS = 1000` lets that come back whole, for
+the same reason as `_DRIVER_MAX_ROWS`.
+
+**Miles come from the stops.** `stp_lgh_mileage` is the distance from the
+previous stop on the leg to this one, and `stp_loadstatus` describes **that
+same segment**. A pickup (`LLD`) is `MT` because the truck ran empty to reach
+it, and the delivery (`LUL`) is `LD`. Summing by status splits a leg:
+
+| `stp_loadstatus` | Stops | Miles (all time) | Reported as |
+|---|---|---|---|
+| `LD` | 787k | 157.8M | `loaded_miles` |
+| `MT` | 415k | 31.2M | `empty_miles` |
+| `BT` | 146k | 1.95M | `bobtail_miles`: tractor, no trailer |
+| `NON`, `UND`, NULL | 296k | 51k | `unclassified_miles` |
+
+Bobtail is kept separate because it is neither loaded nor pulling an empty.
+Whether it counts as deadhead is a business decision, not something this
+server should make. `legheader.lgh_mtmiles` and `lgh_actualmiles` look like
+they would answer this, but neither is populated on any 2025+ leg.
+
+Details that matter:
+
+- The first stop's mileage is **NULL**, not 0. A NULL after the first stop is
+  normally a zero-distance stop, such as a pickup at the previous stop's
+  location. In 4,140 such legs the stop sum still equals `lgh_miles`, so NULL
+  does not mean missing data.
+- `-1` is a "not computed" sentinel on 1,250 stops; `_LEG_MILES` sums only
+  `> 0`.
+- `lgh_miles` matches the stop sum on 88% of completed 2025+ legs. Where they
+  disagree the stops are usually larger (3,312 legs, by 94 miles on average,
+  1,578 at most). The header is larger on 2,689 legs, by 5 on average, 822 of
+  which have no stop mileage at all. Both are returned, with `miles_match`.
+- **Stops order by `stp_mfh_sequence`.** It matches arrival order on all but one
+  of 302k recent stops. `stp_lgh_sequence` looks like the leg-level one, but it
+  disagrees with arrival order on 222k stops and repeats within a leg 78,840 times.
+
+Verified: a truck-month's loaded, empty and total miles equal an independent
+SQL sum exactly, and order 364820's leg reproduces its stops by hand. That is
+391 empty to the pickup plus 128 + 0 + 128 loaded, 647 in total.
+
+`totals` is a second query over **every** matching leg, not the returned page,
+and it is identical whatever `limit` is (checked at 5 and 1000 across 2,976
+September legs). Aggregate questions are answered from it, so truncation never
+shrinks a total.
+
+Leg filters hit `legheader` indexes: `TractorDates`, `ix_lh_prtrl_outst`,
+`dk_lgh_carrier_enddate`, `ix_lh_stdt_outstat`, `dk_lgh_enddate`, `uk_status`,
+and the two driver indexes, through the same `UNION` as `search_stops`.
+`booking_company` reads `lgh_class1`, which equals the booked order's
+`revtype1` on 99.9% of legs. `trip_types` reads `lgh_type1` (`LghType1`, "Trip
+Type": LOCAL, REG = Deck, REEF, LIVEST, VAN, ...), and both take a code or a name.
+
+Order filters (`_LEG_ORDER_FILTERS`) reach a leg **through its stops**:
+`lh.lgh_number IN (SELECT s.lgh_number FROM stops s JOIN orderheader oh ...)`.
+`legheader.ord_hdrnumber` names only one order, and a leg can carry several,
+so filtering on it would miss legs. Miles on a shared leg are the leg's, not
+one order's share. Measured: 50 to 160ms for leg filters, and 370 to 420ms with
+an order filter.
 
 ### Reference Numbers
 

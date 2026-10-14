@@ -597,6 +597,105 @@ _REFERENCE_OUTPUT_JOINS = """
 """
 
 
+# --- Leg search ---------------------------------------------------------------
+#
+# Mileage is taken from the STOPS, not legheader. Each stop's stp_lgh_mileage
+# is the distance driven from the previous stop on the leg TO this one, and its
+# stp_loadstatus describes that same segment: a pickup (LLD) carries 'MT'
+# because the truck ran empty to reach it, the delivery (LUL) 'LD'. The first
+# stop's mileage is NULL. Summing by load status therefore splits a leg into
+# loaded, empty and bobtail miles, which legheader cannot: lgh_mtmiles and
+# lgh_actualmiles are unpopulated on every 2025+ leg.
+#
+# lgh_miles agrees with the stop sum on 88% of completed 2025+ legs. Where it
+# does not, the stops are usually the larger (3,312 legs, by 94 miles on
+# average); the header is larger on 2,689, mostly where the stops carry no
+# mileage at all. Both are returned, with miles_match, so a disagreement is
+# visible rather than hidden.
+#
+# stp_loadstatus: LD loaded, MT empty, BT bobtail (tractor with no trailer -
+# its own cost category, neither loaded nor pulling an empty), and NON / UND /
+# NULL, which carry almost no mileage and are reported as unclassified. -1 is
+# a "not computed" sentinel on 1,250 stops and is excluded. A NULL after the
+# first stop is normally a zero-distance stop - a pickup at the same place as
+# the previous one - not missing data.
+#
+# Stops order within a leg by stp_mfh_sequence, which matches arrival order on
+# all but one of 302k recent stops. stp_lgh_sequence does NOT: it disagrees on
+# 222k of them and repeats within a leg 78,840 times.
+_LEG_MILES = """
+    SELECT
+        COUNT(*) AS stop_count,
+        SUM(CASE WHEN ms.stp_lgh_mileage > 0 THEN ms.stp_lgh_mileage ELSE 0 END) AS miles,
+        SUM(CASE WHEN ms.stp_lgh_mileage > 0 AND ms.stp_loadstatus = 'LD'
+                 THEN ms.stp_lgh_mileage ELSE 0 END) AS loaded_miles,
+        SUM(CASE WHEN ms.stp_lgh_mileage > 0 AND ms.stp_loadstatus = 'MT'
+                 THEN ms.stp_lgh_mileage ELSE 0 END) AS empty_miles,
+        SUM(CASE WHEN ms.stp_lgh_mileage > 0 AND ms.stp_loadstatus = 'BT'
+                 THEN ms.stp_lgh_mileage ELSE 0 END) AS bobtail_miles
+    FROM stops ms
+    WHERE ms.lgh_number = lh.lgh_number
+"""
+
+# Leg outstatus. Completed legs are CMP, not DNE - DNE is a STOP status.
+_LEG_ACTIVE = ("AVL", "PLN", "DSP", "STD")
+_LEG_ACTIVE_SQL = ", ".join(f"'{s}'" for s in _LEG_ACTIVE)
+
+_LEG_FILTERS: dict[str, tuple[str, str]] = {
+    "legs":            ("lh.lgh_number IN ({ph})", "list"),
+    "movements":       ("lh.mov_number IN ({ph})", "list"),
+    # AVL available, PLN planned, DSP dispatched, STD started, CMP completed,
+    # CAN cancelled.
+    "leg_status":      ("lh.lgh_outstatus IN ({ph})", "list"),
+    "active_only":     (f"lh.lgh_outstatus IN ({_LEG_ACTIVE_SQL})", "flag"),
+    "trucks":          ("lh.lgh_tractor IN ({ph})", "list"),
+    "trailers":        ("lh.lgh_primary_trailer IN ({ph})", "list"),
+    "carriers":        ("lh.lgh_carrier IN ({ph})", "list"),
+    # Either seat, as two seeks UNIONed - see "drivers" in _STOP_FILTERS for
+    # why this is not an OR.
+    "drivers":         (
+        "lh.lgh_number IN ("
+        " SELECT d1.lgh_number FROM legheader d1 WHERE d1.lgh_driver1 IN ({ph})"
+        " UNION"
+        " SELECT d2.lgh_number FROM legheader d2 WHERE d2.lgh_driver2 IN ({ph}))",
+        "list_x2",
+    ),
+    # lgh_class1 is the booked order's revtype1 on 99.9% of legs.
+    "booking_company": _label_filter("lh.lgh_class1", "RevType1"),
+    # lgh_type1 is labelled 'Trip Type': LOCAL, REG (Deck), REEF, LIVEST, VAN...
+    "trip_types":      _label_filter("lh.lgh_type1", "LghType1"),
+    "started_after":   ("lh.lgh_startdate >= ?", "date"),
+    "started_before":  ("lh.lgh_startdate < ?", "date"),
+    "ended_after":     ("lh.lgh_enddate >= ?", "date"),
+    "ended_before":    ("lh.lgh_enddate < ?", "date"),
+    "start_companies": ("lh.cmp_id_start IN ({ph})", "list"),
+    "end_companies":   ("lh.cmp_id_end IN ({ph})", "list"),
+    "start_cities":    ("lh.lgh_startcity IN ({ph})", "list"),
+    "end_cities":      ("lh.lgh_endcity IN ({ph})", "list"),
+    "start_states":    ("lh.lgh_startstate IN ({ph})", "list"),
+    "end_states":      ("lh.lgh_endstate IN ({ph})", "list"),
+}
+
+# Order filters reach a leg through its stops, because a leg can carry several
+# orders and an order can span several legs - legheader.ord_hdrnumber names
+# just one of them. "The leg carries a matching order" is the meaning. Kept to
+# the filters that identify orders; dates and booking company have leg-level
+# equivalents above.
+_LEG_ORDER_FILTERS: dict[str, tuple[str, str]] = {
+    "orders":          ("s.ord_hdrnumber IN ({ph})", "list"),
+    "order_numbers":   _ORDER_FILTERS["order_numbers"],
+    "billto":          _ORDER_FILTERS["billto"],
+    "shipper":         _ORDER_FILTERS["shipper"],
+    "consignee":       _ORDER_FILTERS["consignee"],
+    "booking_agent":   _ORDER_FILTERS["booking_agent"],
+}
+
+# 498 legs are active, more than TMW_MAX_SEARCH_ROWS' default of 200, and
+# active_only replaces get_active_legs, which returned them all. Same reasoning
+# as _DRIVER_MAX_ROWS.
+_LEG_MAX_ROWS = 1000
+
+
 def _coerce_date(value):
     if isinstance(value, datetime):
         return value
@@ -843,52 +942,174 @@ class TmwDB:
             for row in cursor.fetchall()
         ]
 
-    def get_active_legs(self) -> list[dict]:
+    def search_legs(self, limit: int | None = None, **filters) -> dict:
+        """Search legs, with loaded / empty / bobtail miles summed from their stops.
+
+        Leg filters apply to legheader directly. Order filters (orders,
+        billto, booking_agent, ...) match legs that carry a stop of a matching
+        order. At least one filter is required; active_only reproduces the
+        old get_active_legs.
+
+        Returns the newest `limit` legs by start date, plus `totals` summed
+        over EVERY matching leg, so an aggregate question is answered
+        correctly even when the row list is truncated.
+        """
         if not self.conn:
             self.connect()
 
+        def supplied(d):
+            return {k: v for k, v in d.items() if v is not None and v is not False}
+
+        unknown = set(filters) - set(_LEG_FILTERS) - set(_LEG_ORDER_FILTERS)
+        if unknown:
+            valid = ", ".join(sorted({**_LEG_FILTERS, **_LEG_ORDER_FILTERS}))
+            raise ValueError(f"Unknown filter {sorted(unknown)[0]!r}. Valid filters: {valid}")
+
+        leg_f = supplied({k: v for k, v in filters.items() if k in _LEG_FILTERS})
+        order_f = supplied({k: v for k, v in filters.items() if k in _LEG_ORDER_FILTERS})
+
+        clauses: list[str] = []
+        params: list = []
+        if leg_f:
+            where, p = _build_where(leg_f, _LEG_FILTERS)
+            clauses.append(where)
+            params.extend(p)
+        if order_f:
+            where, p = _build_where(order_f, _LEG_ORDER_FILTERS)
+            clauses.append(
+                "lh.lgh_number IN (SELECT s.lgh_number FROM stops s"
+                " JOIN orderheader oh ON oh.ord_hdrnumber = s.ord_hdrnumber"
+                f" WHERE {where})"
+            )
+            params.extend(p)
+        if not clauses:
+            # Same wording as _build_where, for the same reason.
+            _build_where({}, _LEG_FILTERS)
+        where = " AND ".join(clauses)
+
+        limit = min(limit or self.max_search_rows, _LEG_MAX_ROWS)
         cursor = self.conn.cursor()
-        cursor.execute("""
+
+        # Deferred join, as elsewhere: pick lgh_numbers narrowly, newest first,
+        # then sum each picked leg's stops - a seek on dk_lghnum per leg.
+        cursor.execute(f"""
+            WITH picked AS (
+                SELECT TOP (?) lh.lgh_number
+                FROM legheader lh
+                WHERE {where}
+                ORDER BY lh.lgh_startdate DESC, lh.lgh_number DESC
+            )
             SELECT
                 lh.lgh_number,
+                lh.mov_number,
                 lh.lgh_outstatus,
-                NULLIF(lh.lgh_tractor, 'UNKNOWN') AS lgh_tractor,
-                NULLIF(lh.lgh_primary_trailer, 'UNKNOWN') AS lgh_primary_trailer,
-                NULLIF(lh.lgh_carrier, 'UNKNOWN') AS lgh_carrier,
+                NULLIF(lh.lgh_tractor, 'UNKNOWN'),
+                NULLIF(lh.lgh_driver1, 'UNKNOWN'),
+                NULLIF(lh.lgh_driver2, 'UNKNOWN'),
+                NULLIF(lh.lgh_carrier, 'UNKNOWN'),
+                NULLIF(lh.lgh_primary_trailer, 'UNKNOWN'),
                 lh.lgh_startdate,
                 lh.lgh_enddate,
-                lh.lgh_startcty_nmstct AS StartCity,
-                lh.lgh_endcty_nmstct AS EndCity,
+                lh.cmp_id_start,
+                lh.lgh_startcty_nmstct,
+                lh.lgh_startstate,
+                lh.cmp_id_end,
+                lh.lgh_endcty_nmstct,
+                lh.lgh_endstate,
+                lh.lgh_class1,
+                lh.lgh_type1,
+                tt.name,
                 lh.lgh_miles,
+                m.stop_count,
+                m.miles,
+                m.loaded_miles,
+                m.empty_miles,
+                m.bobtail_miles,
                 (
-                    SELECT STRING_AGG(ord_hdrnumber, ',')
-                    FROM (
-                        SELECT DISTINCT s.ord_hdrnumber
-                        FROM stops s
-                        WHERE s.lgh_number = lh.lgh_number
-                          AND s.ord_hdrnumber != 0
-                    ) deduped
-                ) AS orders
-            FROM legheader lh
-            WHERE lh.lgh_outstatus IN ('AVL', 'STD', 'PLN')
-        """)
+                    SELECT STRING_AGG(o.ord_hdrnumber, ',')
+                    FROM (SELECT DISTINCT os.ord_hdrnumber FROM stops os
+                          WHERE os.lgh_number = lh.lgh_number
+                            AND os.ord_hdrnumber <> 0) o
+                )
+            FROM picked
+            JOIN legheader lh ON lh.lgh_number = picked.lgh_number
+            OUTER APPLY ({_LEG_MILES}) m
+            LEFT JOIN labelfile tt ON tt.abbr = lh.lgh_type1
+                AND tt.labeldefinition = 'LghType1'
+            ORDER BY lh.lgh_startdate DESC, lh.lgh_number DESC
+        """, [limit + 1, *params])
+        rows = cursor.fetchall()
 
-        return [
-            {
-                "lgh_number": row[0],
-                "status": row[1],
-                "tractor": row[2],
-                "trailer": row[3],
-                "carrier": row[4],
-                "start_date": str(row[5]) if row[5] else None,
-                "end_date": str(row[6]) if row[6] else None,
-                "start_city": row[7],
-                "end_city": row[8],
-                "miles": row[9],
-                "orders": row[10],
-            }
-            for row in cursor.fetchall()
-        ]
+        # Totals over every matching leg, not just the returned page.
+        cursor.execute(f"""
+            SELECT
+                COUNT(*),
+                SUM(m.miles),
+                SUM(m.loaded_miles),
+                SUM(m.empty_miles),
+                SUM(m.bobtail_miles),
+                SUM(CAST(lh.lgh_miles AS bigint))
+            FROM legheader lh
+            OUTER APPLY ({_LEG_MILES}) m
+            WHERE {where}
+        """, params)
+        t = cursor.fetchone()
+
+        return {
+            "legs": [self._leg_row_to_dict(r) for r in rows[:limit]],
+            "count": min(len(rows), limit),
+            "truncated": len(rows) > limit,
+            "totals": self._miles_breakdown(
+                t[1], t[2], t[3], t[4], {"legs": t[0], "header_miles": t[5]}),
+        }
+
+    @staticmethod
+    def _miles_breakdown(miles, loaded, empty, bobtail, extra: dict) -> dict:
+        miles, loaded, empty, bobtail = (int(v or 0) for v in (miles, loaded, empty, bobtail))
+        return {
+            **extra,
+            "miles": miles,
+            "loaded_miles": loaded,
+            "empty_miles": empty,
+            "bobtail_miles": bobtail,
+            # NON / UND / no load status: a few thousand miles in all history.
+            "unclassified_miles": miles - loaded - empty - bobtail,
+            "loaded_pct": round(100.0 * loaded / miles, 1) if miles else None,
+        }
+
+    def _leg_row_to_dict(self, row) -> dict:
+        def text(value):
+            return value.strip() if isinstance(value, str) and value.strip() else None
+
+        out = {
+            "lgh_number": row[0],
+            "mov_number": row[1],
+            "status": row[2],
+            "truck": text(row[3]),
+            "driver": text(row[4]),
+            "codriver": text(row[5]),
+            "carrier": text(row[6]),
+            "trailer": text(row[7]),
+            "start_date": str(row[8]) if row[8] else None,
+            "end_date": str(row[9]) if row[9] else None,
+            "start_company": text(row[10]),
+            "start_city": row[11],
+            "start_state": text(row[12]),
+            "end_company": text(row[13]),
+            "end_city": row[14],
+            "end_state": text(row[15]),
+            "booking_company": text(row[16]),
+            "trip_type": text(row[17]),
+            "trip_type_name": row[18],
+            "stop_count": row[20] or 0,
+            "orders": [int(o) for o in row[25].split(",")] if row[25] else [],
+        }
+        out.update(self._miles_breakdown(row[21], row[22], row[23], row[24], {}))
+        # legheader's own figure, for comparison. The stop sum above is the
+        # one to report; the two disagree on about 12% of completed legs.
+        out["header_miles"] = row[19]
+        out["miles_match"] = row[19] == out["miles"]
+        return out
 
     _STOP_SELECT = """
         s.stp_number,
