@@ -298,8 +298,10 @@ compose.yml.example     Container config template (copy to compose.yml)
 | `search_legs` | many optional filters | Legs with total, loaded, empty and bobtail miles summed from their stops |
 | `search_stops` | `scope` + many optional filters | Stops by identity, status, date, appointment, location, driver, truck |
 | `search_drivers` | `name` + many optional filters | Drivers by code, name, status, assignment, licence |
-| `search_orders` | many optional filters | Orders by date, customer, location, revenue type |
-| `summarize_orders` | `group_by` + same filters | Aggregated order totals, split by currency |
+| `search_orders` | many optional filters | Orders with billed revenue, tax and invoice chain |
+| `summarize_orders` | `group_by` + same filters | Aggregated revenue, split by currency |
+| `search_invoice` | invoice + chain filters | Invoices, credits and rebills, with totals by currency |
+| `search_invoice_details` | `billing_state` + line filters | Billing lines (linehaul, fuel, accessorials, tax), invoiced or pending |
 | `find_city_codes` | `name`, `state` | Resolve a city name to the numeric codes orders store |
 | `list_booking_agents` | `include_retired` | Booking agents (revtype4) with order counts |
 | `list_booking_companies` | `include_retired` | Booking sub-companies (revtype1) with order counts |
@@ -308,19 +310,36 @@ compose.yml.example     Container config template (copy to compose.yml)
 | `summarize_order_freight` | `orders` | Per-order freight totals, with PUP vs DRP `in_sync` flag |
 | `search_freight` | freight + order filters | Freight by commodity, weight, temperature, dimensions |
 
-**Charges carry a currency.** 84% of orders in this database are Canadian
-dollars and 16% US, so `search_orders` returns `currency` (the stored label,
-e.g. `CA$`) and `currency_code` (`CAD`, `USD` or `UNK`) next to
-`total_charge`. Filter with `currency=["CAD"]` or `currency=["US$"]` —
-spellings are interchangeable, which matters because some orders are stored as
-`US` rather than `US$`.
+**Revenue comes from invoices, not the order.** `ord_totalcharge` is 0 on 42%
+of invoiced orders (those customers are rated only at invoicing), keeps the
+original amount after a billing correction, and holds a few typo values in the
+millions. So `search_orders` and `summarize_orders` report `revenue`, which is
+what was actually billed before tax:
 
-`summarize_orders` splits every group by currency for the same reason: money is
-only additive within one currency. One logical group comes back as several
-rows, each with its own `currency`, so report a total with its currency and
-never add two rows together. Group by `currency` to get the per-currency
-figures directly. Charges are not converted between currencies — the stored
-exchange rates are too sparse in the CAD-to-USD direction to trust.
+- **Invoiced orders:** the net of all live invoices, including credits,
+  rebills and supplementals.
+- **Orders not yet invoiced:** their pending billing lines.
+- **Cancelled orders, quotes and orders whose invoices were all cancelled:** 0.
+
+`revenue_source` says which rule applied. The order's own figure is still
+returned, as `order_total_charge`, for comparison only.
+
+**Billing corrections are chains, not edits.** A wrong invoice is reversed by
+a credit memo (`CRD`) and replaced by a rebill (`RBIL`). Numbers share the
+order number plus a letter, such as 346778A, 346778B and 346778C.
+`search_invoice` returns invoices grouped by chain, with `total` including tax
+and `pretax_total` without. `search_invoice_details` returns the charge lines,
+both invoiced and not yet invoiced. Tax is flagged by `is_tax`; it is
+identified from the charge type, because GST is stored as an ordinary line item.
+
+**Money carries a currency.** About 84% of revenue is Canadian dollars and 16%
+US. Revenue currency comes from the invoice, which resolves most orders stored
+with currency `UNK`. Filter with `currency=["CAD"]` or `currency=["US$"]`;
+spellings are interchangeable. `summarize_orders` splits every group by
+currency, because money only adds up within one currency, so one logical group
+can come back as several rows. Report each total with its currency and never
+add rows together. Charges are never converted: the stored CAD-to-USD rates
+are years stale. Payment status is not tracked in TMW.
 
 `search_drivers` looks up the 676-row driver table by code or by name. Because
 the table is small, `name` is a substring search and word order does not

@@ -322,8 +322,10 @@ filters compose.
 | `search_legs` | many optional filters | Legs with total / loaded / empty / bobtail miles from their stops, plus `totals`; `active_only` replaces `get_active_legs` |
 | `search_stops` | `scope` + many optional filters | Stops by identity, status, date, appointment, location, driver, truck - see below |
 | `search_drivers` | `name` + many optional filters | Drivers by code, name, status, assignment, licence - see below |
-| `search_orders` | many optional filters | Orders by date, customer, location, revenue type — see below |
-| `summarize_orders` | `group_by` + same filters | Aggregated order totals instead of rows, split by currency |
+| `search_orders` | many optional filters | Orders with revenue from invoices — see Revenue below |
+| `summarize_orders` | `group_by` + same filters | Aggregated revenue (from invoices) instead of rows, split by currency |
+| `search_invoice` | invoice + chain filters | Invoices with tax split out; credit/rebill chains; totals by currency |
+| `search_invoice_details` | `billing_state` + line filters | Billing lines, invoiced or pending, with charge types and tax flag |
 | `find_city_codes` | `name`, `state` | Resolve a city name to the numeric codes orders store |
 | `list_booking_agents` | `include_retired` | Booking agents (revtype4) with order counts and first/last order |
 | `list_booking_companies` | `include_retired` | Booking sub-companies (revtype1), same shape |
@@ -483,10 +485,28 @@ movement on average, 84 at the worst, 199 movements above 20 — so `limit`
 movements is at most a few thousand rows.
 
 It also surfaces stops with `ord_hdrnumber = 0`, which is **not an order**:
-there is no row 0 in `orderheader`. Those 790k stops are empty equipment events
-(`BMT`, `DMT`, `DLT`, `HLT`, `RTP`) on the empty legs a movement may carry at
-either end, so they are legitimate trip context, and `ord_number` /
-`order_status` come back NULL for them.
+there is no row 0 in `orderheader`. Those 790k stops are **non-billable
+stops**, and they are not all empty. Five years of them, by event and the load
+status of the segment driven to them:
+
+| Event | Stops | Load status |
+|---|---|---|
+| `DMT` drop empty trailer | 41,093 | empty |
+| `BMT` begin empty | 34,698 | mostly unrecorded; 5,222 empty |
+| `HLT` hook loaded trailer | 25,189 | bobtail *to* the hook (14,284) |
+| `DLT` drop loaded trailer | 25,186 | **loaded, every one** |
+| `BBT` begin bobtail | 16,433 | mixed |
+| `RTP` route point | 13,777 | **mostly loaded** (10,773) |
+| `HMT` hook empty trailer | 12,883 | bobtail / empty |
+| `EMT`, `EBT` end empty / bobtail | 12,041 | empty / bobtail |
+| `NBCST`, `NBS` non-billable customs / stop | 781 | mixed |
+| `INSP`, `SCALE` | 358 | loaded |
+
+DLT and HLT are by definition the two halves of a Park/Hook on a *loaded*
+trailer, so "no order" must never be read as "empty". This doc and the server
+instructions once described these as empty equipment moves, which was wrong.
+They are legitimate trip context, and `ord_number` / `order_status` come back
+NULL for them.
 
 Naming: `stop_status` and `departure_status` are the stop's, while plain
 `status` and `invoice_status` are the **order's**, inherited from
@@ -544,30 +564,28 @@ without `ord_currency` beside it.** The split:
 | `CDN $` | 2 | CAD |
 
 So one currency is stored under two names in both directions, and there is no
-`Currency` row in `labelfile` to decode them. `_CURRENCY_NORM` folds the
-spellings in SQL, `_norm_currency` folds the caller's input the same way, and
-`search_orders` returns both: `currency` (the stored label) and
-`currency_code` (CAD / USD / UNK). A filter therefore accepts any spelling —
-`currency=["US$"]`, `["USD"]` and `["us"]` are the same query — which matters
-because the 549 rows spelled `US` would otherwise be missed by the obvious
-`US$`.
+`Currency` row in `labelfile` to decode them. `_fold_currency` folds the
+spellings in SQL (for any column: order, invoice header), `_norm_currency`
+folds the caller's input the same way, so `currency=["US$"]`, `["USD"]` and
+`["us"]` are the same query. That matters because the 549 rows spelled `US`
+would otherwise be missed by the obvious `US$`.
+
+**Revenue currency comes from the invoice, not the order** (see Revenue
+below). 10,941 orders stored as `UNK` were invoiced in CA$ or US$, and 1,484
+were invoiced in a different currency from the one on the order.
+`search_orders` returns `revenue_currency` (from invoices, else the order) and
+`order_currency` (the order's folded code). The `currency` filter tests the
+revenue currency via `_REVENUE_CURRENCY`: the latest live invoice's, since a
+currency correction rebills in the right one.
 
 **`summarize_orders` splits every group by currency**, and that was a bug fix,
-not a feature. Each `_ORDER_GROUPS` key spans several currencies here — all
-five of the busiest `revtype1` values mix three to five — so a single
-`SUM(ord_totalcharge)` per group was adding Canadian and US dollars together.
-Grouping 2024-onward orders by `revtype1`, `EPT` reported one total of
-**92,407,307**, which is really 74.96M CAD + 6.42M USD + 11.02M unrecorded.
-`rev_per_mile` was worse: the blended 13.45 hid 13.45 CAD/mi against 1.97
-USD/mi.
-
-The currency joins the `GROUP BY` rather than being summed wrong and then
-flagged, so each row is single-currency by construction. One logical group can
-come back as several rows, each carrying its own `currency`, and
-`split_by_currency` says so in the result. Grouping by `currency` itself is the
-one case not split further, since it would key on it twice. Verified: the split
-subtotals re-add exactly to the old mixed figures, so nothing was lost — only
-separated.
+not a feature. Each `_ORDER_GROUPS` key spans several currencies here, so a
+single `SUM` per group added Canadian and US dollars together. Grouping
+2024-onward orders by `revtype1`, `EPT` once reported one total of
+**92,407,307**, mixing three currencies. The currency is part of the
+`GROUP BY`, so each row is single-currency by construction, and one logical
+group can come back as several rows. `split_by_currency` says so. Grouping by
+`currency` keys on the revenue currency.
 
 **Charges are never converted.** There is a `currency_exchange` table
 (`cex_from_curr`, `cex_to_curr`, `cex_date`, `cex_rate`), but it is unusable in
@@ -579,9 +597,139 @@ it is ever wanted — but presenting a converted figure as authoritative when th
 rate is years stale is a worse failure than reporting two currencies
 separately.
 
-Note the 16,969 `UNK` orders are not a rounding error: they carry 13.1M in
-charges across the 2024-onward window alone. Do not assume they are either
-currency.
+### Revenue
+
+**`ord_totalcharge` is not revenue.** An audit of five years of completed,
+invoiced orders (87,493) found the order total captured **66.8%** of what was
+invoiced in CAD and **51.2%** in USD:
+
+- **37,184 invoiced orders (42%) have `ord_totalcharge` = 0.** Linehaul and
+  accessorial are zero too. Those customers are rated only at invoicing, which
+  hid 71M of billing. They concentrate in a few bill-tos: LAUBUR, CORDUN01,
+  JFEBUR and CATMOR.
+- **Corrections are not written back.** On 926 credited and rebilled orders,
+  the order kept the *original* amount on 400 (43%). Supplementals are missing
+  from the order on a quarter of those orders.
+- **Typos.** 15 orders hold totals of 250k to 47.25M on loads billed a few
+  thousand, adding 204M of revenue that was never billed. Order 287123 shows
+  47,250,000 and was invoiced 3,500.
+- Ordinary orders with a real total are mostly right: 85% match the invoice to
+  the cent.
+
+Revenue is therefore read from **billing lines** (`invoicedetail`). They exist
+for an order's whole life: created when it is rated, held with
+`ivh_hdrnumber = 0` ("pending"), and moved onto the invoice when it is billed.
+Rated uninvoiced orders have pending lines matching `ord_totalcharge` on 99%.
+The rule, applied identically by `_revenue_lines` (SQL, set-based),
+`_order_revenue` (Python, per search page) and `_REVENUE_AMOUNT` (scalar, for
+`min_charge`):
+
+1. **Live invoices** (status not `CAN`): the net of all of them before tax,
+   covering the original, credits, rebills and supplementals. Credits reverse
+   their target exactly on 966 of 967. Pending lines are then ignored: 57 of
+   the 102 left on invoiced orders duplicate an invoiced line.
+2. **Not billable**: `CAN` cancelled, `QTE` quote and `MST` master template
+   give 0. Unfiltered summaries used to count 17.6M of cancelled orders, 3.2M
+   of quotes, and a 1.5M typo sitting on a cancelled order. `ICO` (Cancelled
+   Billable) *is* billable.
+3. **Pending lines**: their sum.
+4. **Every invoice cancelled** gives 0, because the bill was withdrawn. There
+   are 212 such completed orders, one with a 23.2M typo that a fallback would
+   resurrect.
+5. Otherwise, `ord_totalcharge`, flagged `revenue_source: "order"`. Among
+   completed orders over five years this is now zero.
+
+**Tax is excluded from revenue and identified by `chargetype.cht_basis =
+'TAX'`, never `ivd_type`.** The `GST` code is typed `LI` on 26,783 lines worth
+3.7M. Testing `ivd_type` made 7,844 orders look 12% under-billed, when the gap
+was really 13% HST.
+
+**Currency is the invoice header's.** `invoicedetail.cur_code` is NULL on most
+invoiced lines and `US` on 2,496 lines of CA$ orders. An `UNK` invoice falls
+back to the order's currency. 130 orders were invoiced in two currencies. On
+129 of them that is a currency correction where every currency but one nets to
+zero, and the zero-net rows are dropped. The remaining one, 305009, is an LH in
+CAD plus a SUPL in USD; it comes back as `revenue: null` with
+`revenue_by_currency`.
+
+`search_orders` returns `revenue`, `revenue_currency`, `revenue_source`, `tax`,
+`invoices` (live invoice numbers), `corrected` and `supplemental`, with
+`order_total_charge` for comparison. The old `total_charge` field was removed,
+so it cannot be quoted by mistake. `summarize_orders` splits revenue into
+`invoiced_revenue`, `pending_revenue` and `order_only_revenue`, and counts
+`non_revenue_orders`.
+
+Before and after, 2024-onward EPT in CAD: the old code reported **76.9M**, of
+which 23.3M was one cancelled-invoice typo, plus cancelled orders and quotes.
+Revenue is **51.0M**.
+
+**`min_charge` and `currency` are revenue tests.** In `search_orders` and the
+other searches they are correlated subqueries in `WHERE`, which is fine under
+`TOP` with a date range. `summarize_orders` pops them and applies them to the
+revenue it has already computed, because as `WHERE` clauses they took **12s**
+over a year, against 0.8s. Both paths agree: one PKS week at 2,000 CAD or more
+gives 39 orders and 194,087.77 either way.
+
+Timing: `search_orders` adds about 40ms for revenue on a 200-row page.
+`summarize_orders` takes 0.8s for a year and 1.7s for five years, up from about
+0.5s.
+
+### Invoices
+
+`invoiceheader` (322k) and `invoicedetail` (1.0M). **A wrong invoice is never
+edited.** It is reversed by a credit memo and replaced, so an order's billing
+is a chain whose numbers share the order's plus a letter: 346778A (LH), then
+346778B (CRD, `ivh_applyto` = 346778A), then 346778C (RBIL).
+
+| `ivh_definition` | 5 years | Meaning |
+|---|---|---|
+| `LH` | 87,753 | Original invoice |
+| `CRD` | 967 | Credit memo: negative, reverses `ivh_applyto` exactly |
+| `RBIL` | 932 | Rebill after a credit |
+| `SUPL` | 452 | Supplemental: extra charges billed later |
+| `MISC` | 3 | Miscellaneous |
+
+Invoice status (`InvoiceStatus`): `XFR` transferred to accounting, `PRN`
+printed, `RTP` ready to print, `HLD` / `HLA` on hold, `CAN` cancelled (223).
+Cancelled invoices are hidden by default and count toward nothing.
+
+- `ivh_totalcharge` equals the sum of its lines on every invoice but 3, and
+  **includes tax**. `search_invoice` returns `total`, `tax` and
+  `pretax_total`.
+- `ivh_billto` differs from the order's `ord_billto` on 1,633 invoices. For
+  billing questions the invoice's is the authoritative one.
+- **Payment is not in TMW.** `ivh_totalpaid`, `ivh_paid_amount`,
+  `ivh_pay_status` and `ivh_paid_indicator` are empty on every invoice, so none
+  is exposed. 11,475 invoices sit on master bills (`ivh_mbnumber`), which are
+  exposed.
+- `invoicedetail.ord_hdrnumber` equals its header's on all 320,865 lines
+  checked.
+
+`search_invoice` picks newest bill date first and presents chains grouped by
+order in issue order, so a credit sits under its target. `totals_by_currency`
+covers every match.
+
+`search_invoice_details` covers both stages of a line's life. `billing_state`
+is derived per line (`_LINE_STATE`):
+
+| State | Meaning | Default |
+|---|---|---|
+| `invoiced` | on a live invoice | shown |
+| `pending` | rated, not yet invoiced | shown |
+| `cancelled` | on a cancelled invoice | hidden |
+| `superseded` | left pending on an order since invoiced | hidden |
+
+`billing_state="all"` shows the inactive ones. `ivd_type` is `SUB`
+(linehaul), `LI` (accessorials, fuel and GST), `TAX`, or `DRP` / `PUP`
+(per-stop lines, almost always 0). Zero lines are hidden unless
+`include_zero_lines`. Order filters apply through the line's order. `orders`
+seeks `invoicedetail`'s own `ord_hdrnumber` index, so it reaches pending lines,
+which have no header.
+
+Indexes used: `dk_ivh_ord_hdrnum` (`ord_hdrnumber`, `ivh_billdate`),
+`sk_ivh_billdt`, `sk_ivh_billto`, `uk_invnum`, `dk_applyto`; on lines,
+`sk_ivd_invoice` (`ivh_hdrnumber`), `ord_number` (`ord_hdrnumber`) and the
+clustered `pk_ivd_number`. Measured: 14 to 450ms.
 
 ### Leg Search and Mileage
 
@@ -664,7 +812,7 @@ stops, PAPS/ACE numbers on freight lines, and copies on invoice lines.
 
 **"Every reference has an order" is 99% true.** Of the four exposed owners,
 12.4k rows carry `ord_hdrnumber = 0`, almost all on stops. Those sit on
-empty-move stops (`DLT`, `DMT`, `RTP`, `BMT`), such as a B/L on a drop, so they are
+non-billable stops, such as a B/L on a `DLT` drop or a route point, so they are
 returned with a NULL order and their `mov_number` / `lgh_number`. Where the
 ref's order disagrees with its owner's, it is 0.02% (113 stops, 6 freight, 87
 invoice lines), and the ref's own value is reported.

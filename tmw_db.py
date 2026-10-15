@@ -23,11 +23,145 @@ _CURRENCY_ALIASES = {
     "CA$": "CAD", "CDN $": "CAD", "CDN$": "CAD", "CAD": "CAD", "CA": "CAD",
     "US$": "USD", "US": "USD", "USD": "USD",
 }
-_CURRENCY_NORM = (
-    "(CASE LTRIM(RTRIM(COALESCE(oh.ord_currency, ''))) "
-    "WHEN 'CA$' THEN 'CAD' WHEN 'CDN $' THEN 'CAD' WHEN 'CDN$' THEN 'CAD' "
-    "WHEN 'US$' THEN 'USD' WHEN 'US' THEN 'USD' "
-    "WHEN '' THEN 'UNK' ELSE 'UNK' END)"
+def _fold_currency(column: str) -> str:
+    """SQL folding a stored currency label to CAD / USD / UNK."""
+    return (
+        f"(CASE LTRIM(RTRIM(COALESCE({column}, ''))) "
+        "WHEN 'CA$' THEN 'CAD' WHEN 'CDN $' THEN 'CAD' WHEN 'CDN$' THEN 'CAD' "
+        "WHEN 'US$' THEN 'USD' WHEN 'US' THEN 'USD' "
+        "ELSE 'UNK' END)"
+    )
+
+
+_CURRENCY_NORM = _fold_currency("oh.ord_currency")
+
+
+# --- Revenue ----------------------------------------------------------------
+#
+# orderheader.ord_totalcharge is NOT revenue. Audited over five years of
+# completed, invoiced orders (87,493), it captured 66.8% of what was invoiced
+# in CAD and 51.2% in USD:
+#
+#   - 37,184 invoiced orders (42%) carry ord_totalcharge = 0 - those customers
+#     are rated at invoicing, never on the order - hiding 71M of billing.
+#   - When a wrong invoice is credited and rebilled, the order keeps the
+#     ORIGINAL amount on 43% of corrected orders; supplemental invoices are
+#     missing from it on a quarter.
+#   - 15 orders hold typo totals (up to 47,250,000 on a 3,500 load) that would
+#     add 204M of revenue that was never billed.
+#
+# Revenue is therefore read from the billing lines (invoicedetail), which
+# exist for the whole life of an order: before invoicing they sit with
+# ivh_hdrnumber = 0 ("pending"), and invoicing moves them onto the invoice.
+# Per order:
+#
+#   1. Any live invoice (status <> 'CAN')  -> the net of ALL its live invoices:
+#      original + credits + rebills + supplementals. Credits are negative and
+#      reverse their target exactly (966 of 967), so the sum is the final
+#      billed amount. Pending lines are ignored once invoiced: 57 of the 102
+#      left behind on invoiced orders duplicate an invoiced line.
+#   2. Not billable - CAN cancelled, QTE quote, MST master template -> 0.
+#      Without this, an unfiltered summary counted 17.6M of cancelled orders,
+#      3.2M of quotes and a 1.5M typo on a cancelled order as revenue. ICO
+#      (Cancelled Billable) IS billable and falls through.
+#   3. Pending lines                       -> their sum; this matches
+#      ord_totalcharge on 99% of uninvoiced rated orders.
+#   4. Invoiced, but every invoice CANCELLED -> 0. The bill was withdrawn; 212
+#      completed orders, one carrying a 23.2M typo in ord_totalcharge that a
+#      fallback would have resurrected.
+#   5. Otherwise                           -> ord_totalcharge, flagged 'order'.
+#
+# Tax is excluded from revenue and reported separately. It is identified by
+# chargetype.cht_basis = 'TAX', NOT by ivd_type = 'TAX': the GST code is typed
+# 'LI' on 26,783 lines (3.7M), and testing ivd_type made 7,844 orders look 12%
+# under-billed when the gap was 13% HST.
+#
+# Currency comes from the invoice header; invoicedetail.cur_code is NULL on
+# most lines and 'US' on thousands of CA$ lines. An UNK invoice currency falls
+# back to the order's. 130 orders were invoiced in two currencies - a
+# currency correction, credited and rebilled - and on 129 every currency but
+# one nets to zero, so zero-net currency rows are dropped where the order has
+# another.
+
+_IS_TAX = "(CASE WHEN rch.cht_basis = 'TAX' THEN 1 ELSE 0 END)"
+_NOT_BILLABLE = ("CAN", "QTE", "MST")
+_NOT_BILLABLE_SQL = ", ".join(f"'{s}'" for s in _NOT_BILLABLE)
+
+# Billing-line rows for the orders in CTE `{src}`, which must expose
+# ord_hdrnumber, ord_cur (the order's folded currency) and ord_status. One row
+# per (order, currency, source) with pretax revenue and tax. Steps 2, 4 and 5
+# of the rule apply to orders with no row here, and are the caller's.
+_REVENUE_LINES = """
+    SELECT {src}.ord_hdrnumber,
+           COALESCE(NULLIF({inv_cur}, 'UNK'), {src}.ord_cur) AS cur,
+           'invoiced' AS src,
+           SUM(CASE WHEN {is_tax} = 1 THEN 0 ELSE rd.ivd_charge END) AS rev,
+           SUM(CASE WHEN {is_tax} = 1 THEN rd.ivd_charge ELSE 0 END) AS tax
+    FROM {src}
+    JOIN invoiceheader rih ON rih.ord_hdrnumber = {src}.ord_hdrnumber
+        AND rih.ivh_invoicestatus <> 'CAN'
+    JOIN invoicedetail rd ON rd.ivh_hdrnumber = rih.ivh_hdrnumber
+    LEFT JOIN chargetype rch ON rch.cht_itemcode = rd.cht_itemcode
+    GROUP BY {src}.ord_hdrnumber, COALESCE(NULLIF({inv_cur}, 'UNK'), {src}.ord_cur)
+    UNION ALL
+    SELECT {src}.ord_hdrnumber, {src}.ord_cur, 'pending',
+           SUM(CASE WHEN {is_tax} = 1 THEN 0 ELSE rd.ivd_charge END),
+           SUM(CASE WHEN {is_tax} = 1 THEN rd.ivd_charge ELSE 0 END)
+    FROM {src}
+    JOIN invoicedetail rd ON rd.ord_hdrnumber = {src}.ord_hdrnumber
+        AND COALESCE(rd.ivh_hdrnumber, 0) = 0
+    LEFT JOIN chargetype rch ON rch.cht_itemcode = rd.cht_itemcode
+    WHERE NOT EXISTS (SELECT 1 FROM invoiceheader x
+                      WHERE x.ord_hdrnumber = {src}.ord_hdrnumber
+                        AND x.ivh_invoicestatus <> 'CAN')
+      AND {src}.ord_status NOT IN ({not_billable})
+    GROUP BY {src}.ord_hdrnumber, {src}.ord_cur
+"""
+
+
+def _revenue_lines(src: str) -> str:
+    return _REVENUE_LINES.format(
+        src=src, inv_cur=_fold_currency("rih.ivh_currency"), is_tax=_IS_TAX,
+        not_billable=_NOT_BILLABLE_SQL)
+
+
+# Steps 2, 4 and 5 for an order with no billing-line row: (revenue, source).
+_REVENUE_FALLBACK = (
+    f"CASE WHEN oh.ord_status IN ({_NOT_BILLABLE_SQL}) THEN 'not_billable'"
+    " WHEN EXISTS (SELECT 1 FROM invoiceheader fi WHERE fi.ord_hdrnumber = oh.ord_hdrnumber)"
+    " THEN 'invoice_cancelled' ELSE 'order' END"
+)
+
+
+# Scalar forms for WHERE clauses, usable in any query that aliases
+# orderheader as `oh` - order, stop, freight, leg and reference searches all
+# inherit the filters built on them.
+#
+# Revenue currency: the latest live invoice's (a currency correction rebills
+# in the right one), else the order's.
+_REVENUE_CURRENCY = (
+    "COALESCE((SELECT TOP 1 NULLIF(" + _fold_currency("ci.ivh_currency") + ", 'UNK')"
+    " FROM invoiceheader ci WHERE ci.ord_hdrnumber = oh.ord_hdrnumber"
+    " AND ci.ivh_invoicestatus <> 'CAN'"
+    " ORDER BY ci.ivh_billdate DESC, ci.ivh_hdrnumber DESC), " + _CURRENCY_NORM + ")"
+)
+# Pretax revenue by the three-step rule above, summed across currencies (only
+# one order in five years has two that do not net to zero).
+_REVENUE_AMOUNT = (
+    "COALESCE(CASE WHEN EXISTS (SELECT 1 FROM invoiceheader vi"
+    " WHERE vi.ord_hdrnumber = oh.ord_hdrnumber AND vi.ivh_invoicestatus <> 'CAN')"
+    " THEN (SELECT COALESCE(SUM(vd.ivd_charge), 0) FROM invoiceheader vi"
+    " JOIN invoicedetail vd ON vd.ivh_hdrnumber = vi.ivh_hdrnumber"
+    " LEFT JOIN chargetype vc ON vc.cht_itemcode = vd.cht_itemcode"
+    " WHERE vi.ord_hdrnumber = oh.ord_hdrnumber AND vi.ivh_invoicestatus <> 'CAN'"
+    " AND COALESCE(vc.cht_basis, '') <> 'TAX')"
+    f" WHEN oh.ord_status IN ({_NOT_BILLABLE_SQL}) THEN 0"
+    " ELSE (SELECT SUM(vd.ivd_charge) FROM invoicedetail vd"
+    " LEFT JOIN chargetype vc ON vc.cht_itemcode = vd.cht_itemcode"
+    " WHERE vd.ord_hdrnumber = oh.ord_hdrnumber AND COALESCE(vd.ivh_hdrnumber, 0) = 0"
+    " AND COALESCE(vc.cht_basis, '') <> 'TAX') END,"
+    " CASE WHEN EXISTS (SELECT 1 FROM invoiceheader vi WHERE vi.ord_hdrnumber = oh.ord_hdrnumber)"
+    " THEN 0 ELSE oh.ord_totalcharge END)"
 )
 
 
@@ -121,10 +255,12 @@ _ORDER_FILTERS: dict[str, tuple[str, str]] = {
     "started_before":   ("oh.ord_startdate < ?", "date"),
     "completed_after":  ("oh.ord_completiondate >= ?", "date"),
     "completed_before": ("oh.ord_completiondate < ?", "date"),
-    "min_charge":       ("oh.ord_totalcharge >= ?", "scalar"),
-    # Compared against the folded code, so any spelling works; search_orders
-    # and summarize_orders put the supplied values through _norm_currency.
-    "currency":         (f"{_CURRENCY_NORM} IN ({{ph}})", "list"),
+    # Both compare REVENUE (see "Revenue" above), not ord_totalcharge, which
+    # is 0 on 42% of invoiced orders. Correlated subqueries, so pair them with
+    # an indexed filter such as a date range.
+    "min_charge":       (f"{_REVENUE_AMOUNT} >= ?", "scalar"),
+    # Folded code, so any spelling works; _build_where normalises the input.
+    "currency":         (f"{_REVENUE_CURRENCY} IN ({{ph}})", "list"),
 }
 
 # group_by name -> (key expression, optional label expression)
@@ -396,6 +532,11 @@ def _real_date(value):
     if value < _DATE_SENTINEL_LOW or value > _DATE_SENTINEL_HIGH:
         return None
     return str(value)
+
+
+def _money(value):
+    """Round a money column for output; None stays None."""
+    return round(float(value), 2) if value is not None else None
 
 
 def _like_term(term: str) -> str:
@@ -694,6 +835,127 @@ _LEG_ORDER_FILTERS: dict[str, tuple[str, str]] = {
 # active_only replaces get_active_legs, which returned them all. Same reasoning
 # as _DRIVER_MAX_ROWS.
 _LEG_MAX_ROWS = 1000
+
+
+# --- Invoice search -----------------------------------------------------------
+#
+# invoiceheader (322k) holds one row per invoice; invoicedetail (1.0M) its
+# lines. A wrong invoice is never edited or deleted. It is reversed by a
+# credit memo and replaced, so an order's billing is a CHAIN of invoices
+# whose numbers share the order's and add a letter: 346778A (LH) ->
+# 346778B (CRD, ivh_applyto = 346778A) -> 346778C (RBIL). Summing every live
+# invoice in the chain gives what was finally billed.
+#
+# ivh_definition, five years of invoices:
+#   LH    87,753  original invoice
+#   CRD      967  credit memo - negative, reverses ivh_applyto exactly
+#   RBIL     932  rebill issued after a credit
+#   SUPL     452  supplemental - extra charges billed later
+#   MISC       3  miscellaneous
+# Status (labelfile InvoiceStatus): XFR transferred to accounting, PRN
+# printed, RTP ready to print, HLD / HLA on hold, CAN cancelled. CAN invoices
+# are excluded by default; they count toward nothing.
+#
+# ivh_totalcharge equals the sum of the invoice's lines and INCLUDES TAX. Tax
+# is identified by chargetype.cht_basis = 'TAX', never ivd_type (see
+# "Revenue"). ivh_billto differs from the order's billto on 1,633 invoices -
+# for billing questions the invoice's is authoritative. Payment columns
+# (ivh_totalpaid, ivh_pay_status, ...) are empty on every row: payment is not
+# tracked in TMW, so it is not exposed.
+_INVOICE_TYPES = {
+    "LH": "Original invoice",
+    "CRD": "Credit memo",
+    "RBIL": "Rebill",
+    "SUPL": "Supplemental",
+    "MISC": "Miscellaneous",
+}
+_INVOICE_CURRENCY = _fold_currency("ih.ivh_currency")
+
+_INVOICE_FILTERS: dict[str, tuple[str, str]] = {
+    "invoice_numbers":  ("ih.ivh_invoicenumber IN ({ph})", "list"),
+    "invoices":         ("ih.ivh_hdrnumber IN ({ph})", "list"),
+    "orders":           ("ih.ord_hdrnumber IN ({ph})", "list"),
+    "order_numbers":    ("ih.ord_number IN ({ph})", "list"),
+    "movements":        ("ih.mov_number IN ({ph})", "list"),
+    "applies_to":       ("ih.ivh_applyto IN ({ph})", "list"),
+    "invoice_types":    ("ih.ivh_definition IN ({ph})", "list"),
+    "invoice_status":   ("ih.ivh_invoicestatus IN ({ph})", "list"),
+    # Every invoice of an order that has been credited or rebilled.
+    "corrected_only":   (
+        "ih.ord_hdrnumber IN (SELECT co.ord_hdrnumber FROM invoiceheader co"
+        " WHERE co.ivh_definition IN ('CRD', 'RBIL') AND co.ivh_invoicestatus <> 'CAN')",
+        "flag",
+    ),
+    "billto":           ("ih.ivh_billto IN ({ph})", "list"),
+    "shipper":          ("ih.ivh_shipper IN ({ph})", "list"),
+    "consignee":        ("ih.ivh_consignee IN ({ph})", "list"),
+    "booking_company":  _label_filter("ih.ivh_revtype1", "RevType1"),
+    "booking_agent":    _label_filter("ih.ivh_revtype4", "RevType4", _REVTYPE4_LEGACY_SQL),
+    "billed_after":     ("ih.ivh_billdate >= ?", "date"),
+    "billed_before":    ("ih.ivh_billdate < ?", "date"),
+    "shipped_after":    ("ih.ivh_shipdate >= ?", "date"),
+    "shipped_before":   ("ih.ivh_shipdate < ?", "date"),
+    "delivered_after":  ("ih.ivh_deliverydate >= ?", "date"),
+    "delivered_before": ("ih.ivh_deliverydate < ?", "date"),
+    "currency":         (f"{_INVOICE_CURRENCY} IN ({{ph}})", "list"),
+    # Includes tax; credits are negative, so max_total=0 finds them.
+    "min_total":        ("ih.ivh_totalcharge >= ?", "scalar"),
+    "max_total":        ("ih.ivh_totalcharge <= ?", "scalar"),
+    "master_bills":     ("ih.ivh_mbnumber IN ({ph})", "list"),
+}
+
+# --- Invoice line search --------------------------------------------------------
+#
+# Billing lines exist for an order's whole life. Before invoicing they sit in
+# invoicedetail with ivh_hdrnumber = 0 ("pending") and match ord_totalcharge
+# on 99% of rated orders; invoicing moves them onto the invoice. So one search
+# covers both, and each line carries its billing_state:
+#
+#   invoiced    - on a live invoice
+#   pending     - not yet invoiced
+#   cancelled   - on a cancelled invoice (inactive)
+#   superseded  - left pending on an order that has since been invoiced; 57
+#                 of these 102 lines duplicate an invoiced line (inactive)
+#
+# ivd_type: SUB the linehaul, LI accessorials and fuel, TAX some taxes (GST is
+# typed LI - trust is_tax), DRP / PUP per-stop lines that almost always carry
+# 0 and are hidden unless include_zero_lines.
+_LINE_STATE = (
+    "(CASE WHEN COALESCE(d.ivh_hdrnumber, 0) = 0 THEN"
+    " CASE WHEN EXISTS (SELECT 1 FROM invoiceheader sx WHERE sx.ord_hdrnumber = d.ord_hdrnumber"
+    " AND sx.ivh_invoicestatus <> 'CAN') THEN 'superseded' ELSE 'pending' END"
+    " WHEN ih.ivh_invoicestatus = 'CAN' THEN 'cancelled' ELSE 'invoiced' END)"
+)
+_LINE_CURRENCY = (
+    f"COALESCE(NULLIF({_INVOICE_CURRENCY}, 'UNK'), {_CURRENCY_NORM})"
+)
+
+_DETAIL_FILTERS: dict[str, tuple[str, str]] = {
+    "lines":            ("d.ivd_number IN ({ph})", "list"),
+    "invoice_numbers":  ("ih.ivh_invoicenumber IN ({ph})", "list"),
+    "invoices":         ("d.ivh_hdrnumber IN ({ph})", "list"),
+    # Overrides the order filter: seeks invoicedetail's own ord_hdrnumber
+    # index, and reaches pending lines, which have no header.
+    "orders":           ("d.ord_hdrnumber IN ({ph})", "list"),
+    "invoice_types":    ("ih.ivh_definition IN ({ph})", "list"),
+    "charge_types":     ("d.cht_itemcode IN ({ph})", "list"),
+    "line_types":       ("d.ivd_type IN ({ph})", "list"),
+    "tax_only":         ("ch.cht_basis = 'TAX'", "flag"),
+    "exclude_tax":      ("COALESCE(ch.cht_basis, '') <> 'TAX'", "flag"),
+    "billed_after":     ("ih.ivh_billdate >= ?", "date"),
+    "billed_before":    ("ih.ivh_billdate < ?", "date"),
+    "stops":            ("d.stp_number IN ({ph})", "list"),
+    "commodities":      ("d.cmd_code IN ({ph})", "list"),
+    "min_line_charge":  ("d.ivd_charge >= ?", "scalar"),
+    "max_line_charge":  ("d.ivd_charge <= ?", "scalar"),
+}
+
+_DETAIL_FROM = """
+    FROM invoicedetail d
+    LEFT JOIN invoiceheader ih ON ih.ivh_hdrnumber = d.ivh_hdrnumber
+    LEFT JOIN orderheader oh   ON oh.ord_hdrnumber = d.ord_hdrnumber
+    LEFT JOIN chargetype ch    ON ch.cht_itemcode = d.cht_itemcode
+"""
 
 
 def _coerce_date(value):
@@ -1166,9 +1428,10 @@ class TmwDB:
         Neither is wrong, but only one answers "what else is on this truck".
 
         Movement scope also surfaces stops with ord_hdrnumber = 0, which is not
-        an order - there is no row 0 in orderheader. Those 790k stops are empty
-        equipment events (BMT, DMT, DLT, HLT, RTP) on the empty legs a movement
-        can carry at either end, so they are real trip context, and ord_number
+        an order - there is no row 0 in orderheader. Those 790k stops are
+        non-billable stops, loaded as well as empty: every DLT is loaded (it is
+        the drop half of a Park/Hook) and most route points are, alongside the
+        DMT / BMT / HMT empty moves. They are real trip context, and ord_number
         and order_status come back NULL for them.
         """
         if not self.conn:
@@ -1369,8 +1632,8 @@ class TmwDB:
             "reference_number": text(row[3]),
             "sequence": row[4],
             "attached_to": _REFERENCE_OWNER_OF.get(row[5], row[5]),
-            # ord_hdrnumber 0 is not an order: those references sit on the
-            # empty-move stops (DLT, DMT, RTP, BMT) of a trip.
+            # ord_hdrnumber 0 is not an order: those references sit on
+            # non-billable stops (a DLT drop, a route point) of a trip.
             "ord_hdrnumber": row[7] or None,
             "ord_number": text(row[8]),
             "order_status": row[9],
@@ -1720,6 +1983,83 @@ class TmwDB:
             "truncated": len(rows) > limit,
         }
 
+    def _order_revenue(self, cursor, orders: dict[int, tuple]) -> dict[int, dict]:
+        """Revenue, tax and invoice chain for a set of orders.
+
+        `orders` maps ord_hdrnumber to (ord_totalcharge, folded order
+        currency, ord_status). Applies the rule documented under "Revenue".
+        """
+        if not orders:
+            return {}
+        ids = list(orders)
+        ph = ", ".join("?" * len(ids))
+        cursor.execute(f"""
+            WITH src AS (
+                SELECT oh.ord_hdrnumber, {_CURRENCY_NORM} AS ord_cur, oh.ord_status
+                FROM orderheader oh WHERE oh.ord_hdrnumber IN ({ph})
+            )
+            {_revenue_lines("src")}
+        """, ids)
+        lines: dict[int, list] = {}
+        for o, cur, src, rev, tax in cursor.fetchall():
+            lines.setdefault(o, []).append((cur, src, float(rev or 0), float(tax or 0)))
+
+        cursor.execute(f"""
+            SELECT ord_hdrnumber, LTRIM(RTRIM(ivh_invoicenumber)), ivh_definition,
+                   ivh_invoicestatus
+            FROM invoiceheader
+            WHERE ord_hdrnumber IN ({ph})
+            ORDER BY ord_hdrnumber, ivh_hdrnumber
+        """, ids)
+        chains: dict[int, list] = {}
+        cancelled: set[int] = set()
+        for o, num, defn, status in cursor.fetchall():
+            if status == "CAN":
+                cancelled.add(o)
+            else:
+                chains.setdefault(o, []).append((num, (defn or "").strip()))
+
+        out = {}
+        for o, (ord_total, ord_cur, ord_status) in orders.items():
+            invs = chains.get(o, [])
+            types = {d for _, d in invs}
+            info = {
+                "invoices": [n for n, _ in invs],
+                "corrected": bool(types & {"CRD", "RBIL"}),
+                "supplemental": "SUPL" in types,
+            }
+            ls = lines.get(o)
+            if not ls:
+                # Steps 2, 4 and 5: nothing billed or pending.
+                if ord_status in _NOT_BILLABLE:
+                    source, rev = "not_billable", 0.0
+                elif o in cancelled:
+                    source, rev = "invoice_cancelled", 0.0
+                else:
+                    source, rev = "order", ord_total
+                out[o] = {**info, "revenue": rev, "revenue_currency": ord_cur,
+                          "revenue_source": source, "tax": None}
+                continue
+            by_cur: dict[str, list] = {}
+            for cur, _, rev, tax in ls:
+                agg = by_cur.setdefault(cur, [0.0, 0.0])
+                agg[0] += rev
+                agg[1] += tax
+            # A currency correction leaves the wrong currency netting to zero.
+            if len(by_cur) > 1:
+                live = {c: v for c, v in by_cur.items() if abs(v[0]) >= 0.01}
+                by_cur = live or by_cur
+            source = "invoiced" if any(s == "invoiced" for _, s, _, _ in ls) else "pending"
+            if len(by_cur) == 1:
+                (cur, (rev, tax)), = by_cur.items()
+                out[o] = {**info, "revenue": round(rev, 2), "revenue_currency": cur,
+                          "revenue_source": source, "tax": round(tax, 2)}
+            else:
+                out[o] = {**info, "revenue": None, "revenue_currency": "MIXED",
+                          "revenue_by_currency": {c: round(v[0], 2) for c, v in by_cur.items()},
+                          "revenue_source": source, "tax": None}
+        return out
+
     def search_orders(self, limit: int | None = None, **filters) -> dict:
         if not self.conn:
             self.connect()
@@ -1766,6 +2106,9 @@ class TmwDB:
 
         rows = cursor.fetchall()
         truncated = len(rows) > limit
+        rows = rows[:limit]
+        revenue = self._order_revenue(
+            cursor, {r[0]: (float(r[18] or 0), r[20], r[2]) for r in rows})
 
         return {
             "orders": [
@@ -1796,27 +2139,29 @@ class TmwDB:
                     "destination": row[15],
                     "miles": row[16],
                     "weight": row[17],
-                    "total_charge": row[18],
-                    # Both spellings: the stored label, and the folded code to
-                    # compare or group on. A charge means nothing without it -
-                    # this database is 84% CA$ and 16% US$.
-                    "currency": (row[19] or "").strip() or None,
-                    "currency_code": row[20],
+                    # revenue, revenue_currency, revenue_source, tax,
+                    # invoices, corrected, supplemental.
+                    **revenue[row[0]],
+                    # What the order itself says: 0 on 42% of invoiced orders
+                    # and stale on corrected ones. For comparison only.
+                    "order_total_charge": row[18],
+                    "order_currency": row[20],
                     "mov_number": row[21],
                 }
-                for row in rows[:limit]
+                for row in rows
             ],
-            "count": min(len(rows), limit),
+            "count": len(rows),
             "truncated": truncated,
         }
 
     def summarize_orders(self, group_by: str, limit: int | None = None, **filters) -> dict:
-        """Aggregate order totals by one grouping key, split by currency.
+        """Aggregate order revenue by one grouping key, split by currency.
 
-        The currency is always part of the group key (except when grouping by
-        currency itself, which would key on it twice), so a `total_charge` is
-        never a sum of mixed Canadian and US dollars. One logical group can
-        therefore come back as several rows, one per currency it contains.
+        Revenue follows the rule under "Revenue": invoices, else pending
+        lines, else ord_totalcharge. Each order's revenue is split by its
+        invoice currency, so every row is single-currency; one logical group
+        can come back as several rows. Grouping by currency keys on the
+        revenue currency.
         """
         if not self.conn:
             self.connect()
@@ -1828,41 +2173,101 @@ class TmwDB:
         key_expr, label_expr = spec
 
         limit = min(limit or self.max_search_rows, self.max_search_rows)
+
+        # min_charge and currency are revenue tests. As WHERE clauses they are
+        # correlated subqueries per order (12s over a year); here revenue is
+        # already computed per order, so apply them to that instead.
+        min_charge = filters.pop("min_charge", None)
+        currency = _norm_currency(filters.pop("currency", None))
+        post, post_params = ["1 = 1"], []
+        if min_charge is not None:
+            post.append("p.ord_rev >= ?")
+            post_params.append(min_charge)
+        if currency:
+            post.append(f"p.cur IN ({', '.join('?' * len(currency))})")
+            post_params.extend(currency)
         where, params = _build_where(filters)
 
-        label_select = f"{label_expr} AS label," if label_expr else "NULL AS label,"
-        group_cols = f"{key_expr}, {label_expr}" if label_expr else key_expr
-
-        # Money is only additive within one currency. Every _ORDER_GROUPS key
-        # spans several here - the five busiest revtype1 values mix 3 to 5 -
-        # so the currency is part of the key and each total is unambiguous.
-        # Grouping by currency alone would otherwise key on it twice.
-        if group_by != "currency":
-            group_cols = f"{group_cols}, {_CURRENCY_NORM}"
+        by_currency = group_by == "currency"
+        grp = "p.cur" if by_currency else "p.grp"
+        label = "NULL" if by_currency or not label_expr else "p.label"
+        # GROUP BY takes real columns only - a constant NULL label is an error.
+        group_cols = ", ".join(dict.fromkeys(
+            c for c in (grp, label, "p.cur") if c != "NULL"))
 
         cursor = self.conn.cursor()
         cursor.execute(f"""
+            WITH f AS (
+                SELECT oh.ord_hdrnumber,
+                       {key_expr} AS grp,
+                       {label_expr or "NULL"} AS label,
+                       {_CURRENCY_NORM} AS ord_cur,
+                       oh.ord_status,
+                       oh.ord_totalcharge, oh.ord_totalmiles, oh.ord_totalweight
+                {_ORDER_FROM}
+                WHERE {where}
+            ),
+            l AS ({_revenue_lines("f")}),
+            p AS (
+                -- One row per (order, currency). An order with no billing
+                -- lines takes step 2, 4 or 5 of the rule: 0 when it is not
+                -- billable or its invoices were all cancelled, otherwise
+                -- ord_totalcharge in its own currency.
+                SELECT f.ord_hdrnumber, f.grp, f.label,
+                       COALESCE(l.cur, f.ord_cur) AS cur,
+                       CASE WHEN l.ord_hdrnumber IS NOT NULL THEN l.rev
+                            WHEN fb.src = 'order' THEN f.ord_totalcharge
+                            ELSE 0 END AS rev,
+                       COALESCE(l.tax, 0) AS tax,
+                       COALESCE(l.src, fb.src) AS src,
+                       f.ord_totalmiles, f.ord_totalweight,
+                       ROW_NUMBER() OVER (PARTITION BY f.ord_hdrnumber
+                                          ORDER BY ABS(COALESCE(l.rev, 0)) DESC) AS rn
+                FROM f LEFT JOIN l ON l.ord_hdrnumber = f.ord_hdrnumber
+                -- Evaluated only for orders with no billing lines.
+                OUTER APPLY (
+                    SELECT {_REVENUE_FALLBACK.replace("oh.", "f.")} AS src
+                    WHERE l.ord_hdrnumber IS NULL
+                ) fb
+            ),
+            q AS (
+                -- Drop a currency that nets to zero beside another (a
+                -- currency correction), but keep an order's main row even at
+                -- zero so a credited-out order still counts.
+                SELECT p.*, SUM(p.rev) OVER (PARTITION BY p.ord_hdrnumber) AS ord_rev
+                FROM p
+                WHERE p.rn = 1 OR ABS(p.rev) >= 0.01
+            )
             SELECT TOP (?)
-                {key_expr} AS grp,
-                {label_select}
-                {_CURRENCY_NORM} AS currency,
-                COUNT(*) AS order_count,
-                SUM(oh.ord_totalcharge) AS total_charge,
-                SUM(oh.ord_totalmiles) AS total_miles,
-                SUM(oh.ord_totalweight) AS total_weight,
-                SUM(oh.ord_totalcharge) / NULLIF(SUM(oh.ord_totalmiles), 0) AS rev_per_mile
-            {_ORDER_FROM}
-            WHERE {where}
+                {grp} AS grp,
+                {label} AS label,
+                p.cur,
+                COUNT(DISTINCT p.ord_hdrnumber),
+                SUM(p.rev),
+                SUM(CASE WHEN p.src = 'invoiced' THEN p.rev ELSE 0 END),
+                SUM(CASE WHEN p.src = 'pending' THEN p.rev ELSE 0 END),
+                SUM(CASE WHEN p.src = 'order' THEN p.rev ELSE 0 END),
+                SUM(p.tax),
+                -- Miles and weight once per order, on its main currency row.
+                SUM(CASE WHEN p.rn = 1 THEN p.ord_totalmiles ELSE 0 END),
+                SUM(CASE WHEN p.rn = 1 THEN p.ord_totalweight ELSE 0 END),
+                COUNT(DISTINCT CASE WHEN p.src IN ('not_billable', 'invoice_cancelled')
+                                    THEN p.ord_hdrnumber END)
+            FROM q AS p
+            WHERE {" AND ".join(post)}
             GROUP BY {group_cols}
-            ORDER BY SUM(oh.ord_totalcharge) DESC
-        """, [limit + 1, *params])
+            ORDER BY SUM(p.rev) DESC
+        """, [*params, limit + 1, *post_params])
 
         rows = cursor.fetchall()
         truncated = len(rows) > limit
 
+        def money(v):
+            return round(float(v), 2) if v is not None else None
+
         return {
             "group_by": group_by,
-            "split_by_currency": group_by != "currency",
+            "split_by_currency": not by_currency,
             "groups": [
                 {
                     "group": row[0],
@@ -1871,15 +2276,308 @@ class TmwDB:
                     # rows for the same group in another currency are separate.
                     "currency": row[2],
                     "order_count": row[3],
-                    "total_charge": row[4],
-                    "total_miles": row[5],
-                    "total_weight": row[6],
-                    "rev_per_mile": round(row[7], 3) or 0.0 if row[7] is not None else None,
+                    "revenue": money(row[4]),
+                    "invoiced_revenue": money(row[5]),
+                    "pending_revenue": money(row[6]),
+                    "order_only_revenue": money(row[7]),
+                    "tax": money(row[8]),
+                    "total_miles": row[9],
+                    "total_weight": row[10],
+                    "rev_per_mile": (round(float(row[4]) / row[9], 3)
+                                     if row[9] and row[4] is not None else None),
+                    # Counted in order_count at 0 revenue: cancelled orders,
+                    # quotes, master templates, and orders whose invoices
+                    # were all cancelled.
+                    "non_revenue_orders": row[11],
                 }
                 for row in rows[:limit]
             ],
             "count": min(len(rows), limit),
             "truncated": truncated,
+        }
+
+    def search_invoice(
+        self,
+        include_cancelled: bool = False,
+        limit: int | None = None,
+        **filters,
+    ) -> dict:
+        """Search invoice headers, with tax split out and per-currency totals.
+
+        Cancelled invoices are excluded unless include_cancelled is true or
+        invoice_status names statuses explicitly. Rows are picked newest bill
+        date first and presented as chains - by order, then in issue order -
+        so a credit sits directly under the invoice it reverses.
+        """
+        if not self.conn:
+            self.connect()
+
+        limit = min(limit or self.max_search_rows, self.max_search_rows)
+        where, params = _build_where(filters, _INVOICE_FILTERS)
+        if not include_cancelled and not filters.get("invoice_status"):
+            where = f"({where}) AND ih.ivh_invoicestatus <> 'CAN'"
+
+        cursor = self.conn.cursor()
+        cursor.execute(f"""
+            WITH picked AS (
+                SELECT TOP (?) ih.ivh_hdrnumber
+                FROM invoiceheader ih
+                WHERE {where}
+                ORDER BY ih.ivh_billdate DESC, ih.ivh_hdrnumber DESC
+            )
+            SELECT
+                ih.ivh_hdrnumber,
+                ih.ivh_invoicenumber,
+                ih.ivh_definition,
+                ih.ivh_invoicestatus,
+                st.name,
+                ih.ivh_applyto,
+                ih.ord_hdrnumber,
+                ih.ord_number,
+                ih.mov_number,
+                ih.ivh_billto,
+                b.cmp_name,
+                ih.ivh_shipper,
+                ih.ivh_consignee,
+                ih.ivh_billdate,
+                ih.ivh_shipdate,
+                ih.ivh_deliverydate,
+                ih.ivh_xferdate,
+                ih.ivh_currency,
+                {_INVOICE_CURRENCY},
+                ih.ivh_totalcharge,
+                t.tax,
+                t.lines,
+                ih.ivh_revtype1,
+                ih.ivh_revtype4,
+                ih.ivh_mbnumber,
+                ih.ivh_mbstatus,
+                ih.ivh_remark
+            FROM picked
+            JOIN invoiceheader ih ON ih.ivh_hdrnumber = picked.ivh_hdrnumber
+            LEFT JOIN company b ON b.cmp_id = ih.ivh_billto
+            LEFT JOIN labelfile st ON st.abbr = ih.ivh_invoicestatus
+                AND st.labeldefinition = 'InvoiceStatus'
+            OUTER APPLY (
+                SELECT COUNT(*) AS lines,
+                       SUM(CASE WHEN tc.cht_basis = 'TAX' THEN td.ivd_charge ELSE 0 END) AS tax
+                FROM invoicedetail td
+                LEFT JOIN chargetype tc ON tc.cht_itemcode = td.cht_itemcode
+                WHERE td.ivh_hdrnumber = ih.ivh_hdrnumber
+            ) t
+            ORDER BY ih.ord_hdrnumber DESC, ih.ivh_hdrnumber
+        """, [limit + 1, *params])
+        rows = cursor.fetchall()
+
+        cursor.execute(f"""
+            SELECT {_INVOICE_CURRENCY}, COUNT(*), SUM(ih.ivh_totalcharge), SUM(t.tax),
+                   SUM(CASE WHEN ih.ivh_definition = 'CRD' THEN ih.ivh_totalcharge ELSE 0 END),
+                   COUNT(DISTINCT ih.ord_hdrnumber)
+            FROM invoiceheader ih
+            OUTER APPLY (
+                SELECT SUM(CASE WHEN tc.cht_basis = 'TAX' THEN td.ivd_charge ELSE 0 END) AS tax
+                FROM invoicedetail td
+                LEFT JOIN chargetype tc ON tc.cht_itemcode = td.cht_itemcode
+                WHERE td.ivh_hdrnumber = ih.ivh_hdrnumber
+            ) t
+            WHERE {where}
+            GROUP BY {_INVOICE_CURRENCY}
+        """, params)
+        totals = [
+            {
+                "currency": r[0],
+                "invoices": r[1],
+                "orders": r[5],
+                "total": _money(r[2]),
+                "tax": _money(r[3]),
+                "pretax_total": _money((r[2] or 0) - (r[3] or 0)),
+                "credits": _money(r[4]),
+            }
+            for r in cursor.fetchall()
+        ]
+
+        def text(v):
+            return v.strip() if isinstance(v, str) and v.strip() else None
+
+        invoices = []
+        for r in rows[:limit]:
+            defn = text(r[2])
+            total, tax = float(r[19] or 0), float(r[20] or 0)
+            invoices.append({
+                "ivh_hdrnumber": r[0],
+                "invoice_number": text(r[1]),
+                "invoice_type": defn,
+                "invoice_type_name": _INVOICE_TYPES.get(defn),
+                "status": text(r[3]),
+                "status_name": r[4],
+                # The invoice a credit memo reverses; on other types, itself.
+                "applies_to": text(r[5]),
+                "ord_hdrnumber": r[6],
+                "ord_number": text(r[7]),
+                "mov_number": r[8],
+                "billto": text(r[9]),
+                "billto_name": r[10],
+                "shipper": text(r[11]),
+                "consignee": text(r[12]),
+                "bill_date": str(r[13]) if r[13] else None,
+                "ship_date": str(r[14]) if r[14] else None,
+                "delivery_date": str(r[15]) if r[15] else None,
+                "transferred_date": str(r[16]) if r[16] else None,
+                "currency": r[18],
+                "currency_label": text(r[17]),
+                # total includes tax; pretax_total is revenue.
+                "total": round(total, 2),
+                "tax": round(tax, 2),
+                "pretax_total": round(total - tax, 2),
+                "line_count": r[21] or 0,
+                "booking_company": text(r[22]),
+                "booking_agent": text(r[23]),
+                "master_bill_number": r[24] or None,
+                "master_bill_status": text(r[25]),
+                "remark": text(r[26]),
+            })
+        return {
+            "invoices": invoices,
+            "count": len(invoices),
+            "truncated": len(rows) > limit,
+            "totals_by_currency": totals,
+        }
+
+    def search_invoice_details(
+        self,
+        billing_state: str = "active",
+        include_zero_lines: bool = False,
+        limit: int | None = None,
+        **filters,
+    ) -> dict:
+        """Search billing lines, invoiced or not yet invoiced.
+
+        billing_state: "active" (default - invoiced plus pending), "invoiced",
+        "pending", or "all", which adds the inactive cancelled and superseded
+        lines. Order filters apply through the line's order.
+        """
+        if not self.conn:
+            self.connect()
+
+        states = {
+            "active": ("invoiced", "pending"),
+            "invoiced": ("invoiced",),
+            "pending": ("pending",),
+            "all": ("invoiced", "pending", "cancelled", "superseded"),
+        }.get((billing_state or "active").lower())
+        if states is None:
+            raise ValueError(
+                "billing_state must be active, invoiced, pending or all, "
+                f"got {billing_state!r}")
+
+        limit = min(limit or self.max_search_rows, self.max_search_rows)
+        merged = {**_ORDER_FILTERS, **_DETAIL_FILTERS}
+        where, params = _build_where(filters, merged)
+        where = f"({where}) AND {_LINE_STATE} IN ({', '.join(repr(s) for s in states)})"
+        if not include_zero_lines:
+            where += " AND d.ivd_charge <> 0"
+
+        cursor = self.conn.cursor()
+        cursor.execute(f"""
+            WITH picked AS (
+                SELECT TOP (?) d.ivd_number
+                {_DETAIL_FROM}
+                WHERE {where}
+                ORDER BY d.ivd_number DESC
+            )
+            SELECT
+                d.ivd_number,
+                d.ivh_hdrnumber,
+                ih.ivh_invoicenumber,
+                ih.ivh_definition,
+                ih.ivh_invoicestatus,
+                {_LINE_STATE},
+                d.ord_hdrnumber,
+                oh.ord_number,
+                ih.ivh_billdate,
+                {_LINE_CURRENCY},
+                d.cht_itemcode,
+                ch.cht_description,
+                d.ivd_type,
+                CASE WHEN ch.cht_basis = 'TAX' THEN 1 ELSE 0 END,
+                d.ivd_description,
+                d.ivd_quantity,
+                d.ivd_unit,
+                d.ivd_rate,
+                d.ivd_rateunit,
+                d.ivd_charge,
+                d.ivd_sequence,
+                d.stp_number,
+                d.cmd_code,
+                COALESCE(ih.ivh_billto, oh.ord_billto)
+            FROM picked
+            JOIN invoicedetail d ON d.ivd_number = picked.ivd_number
+            LEFT JOIN invoiceheader ih ON ih.ivh_hdrnumber = d.ivh_hdrnumber
+            LEFT JOIN orderheader oh   ON oh.ord_hdrnumber = d.ord_hdrnumber
+            LEFT JOIN chargetype ch    ON ch.cht_itemcode = d.cht_itemcode
+            ORDER BY d.ord_hdrnumber DESC, COALESCE(NULLIF(d.ivh_hdrnumber, 0), 2147483647),
+                     d.ivd_sequence, d.ivd_number
+        """, [limit + 1, *params])
+        rows = cursor.fetchall()
+
+        cursor.execute(f"""
+            SELECT {_LINE_CURRENCY}, COUNT(*), SUM(d.ivd_charge),
+                   SUM(CASE WHEN ch.cht_basis = 'TAX' THEN d.ivd_charge ELSE 0 END),
+                   COUNT(DISTINCT d.ord_hdrnumber)
+            {_DETAIL_FROM}
+            WHERE {where}
+            GROUP BY {_LINE_CURRENCY}
+        """, params)
+        totals = [
+            {
+                "currency": r[0],
+                "lines": r[1],
+                "orders": r[4],
+                "total": _money(r[2]),
+                "tax": _money(r[3]),
+                "pretax_total": _money((r[2] or 0) - (r[3] or 0)),
+            }
+            for r in cursor.fetchall()
+        ]
+
+        def text(v):
+            return v.strip() if isinstance(v, str) and v.strip() else None
+
+        lines = [
+            {
+                "ivd_number": r[0],
+                "ivh_hdrnumber": r[1] or None,
+                "invoice_number": text(r[2]),
+                "invoice_type": text(r[3]),
+                "invoice_status": text(r[4]),
+                "billing_state": r[5],
+                "ord_hdrnumber": r[6] or None,
+                "ord_number": text(r[7]),
+                "bill_date": str(r[8]) if r[8] else None,
+                "currency": r[9],
+                "charge_type": text(r[10]),
+                "charge_type_name": r[11],
+                "line_type": text(r[12]),
+                "is_tax": bool(r[13]),
+                "description": text(r[14]),
+                "quantity": r[15],
+                "unit": text(r[16]),
+                "rate": _money(r[17]),
+                "rate_unit": text(r[18]),
+                "charge": _money(r[19]),
+                "sequence": r[20],
+                "stp_number": r[21] or None,
+                "commodity": text(r[22]),
+                "billto": text(r[23]),
+            }
+            for r in rows[:limit]
+        ]
+        return {
+            "lines": lines,
+            "count": len(lines),
+            "truncated": len(rows) > limit,
+            "billing_state": billing_state,
+            "totals_by_currency": totals,
         }
 
     def _freight_row_to_dict(self, row) -> dict:
