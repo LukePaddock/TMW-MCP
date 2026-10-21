@@ -113,7 +113,6 @@ class Settings:
     db_timeout: int
     db_encrypt: str | None
     db_trust_server_certificate: str | None
-    checkcall_lookback_days: int
     max_search_rows: int
     mcp_host: str
     mcp_port: int
@@ -160,7 +159,6 @@ def load_settings() -> Settings:
         db_timeout=_int("TMW_DB_TIMEOUT", 30),
         db_encrypt=_optional("TMW_DB_ENCRYPT"),
         db_trust_server_certificate=_optional("TMW_DB_TRUST_SERVER_CERTIFICATE"),
-        checkcall_lookback_days=_int("TMW_CHECKCALL_LOOKBACK_DAYS", 30),
         max_search_rows=_int("TMW_MAX_SEARCH_ROWS", 200),
         mcp_host=mcp_host,
         mcp_port=_int("TMW_MCP_PORT", 8000),

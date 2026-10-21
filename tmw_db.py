@@ -815,6 +815,13 @@ _LEG_FILTERS: dict[str, tuple[str, str]] = {
     "end_cities":      ("lh.lgh_endcity IN ({ph})", "list"),
     "start_states":    ("lh.lgh_startstate IN ({ph})", "list"),
     "end_states":      ("lh.lgh_endstate IN ({ph})", "list"),
+    # Dispatch notes, on 8% of legs. search_legs wraps the term for LIKE.
+    "comment_contains": ("lh.lgh_comment LIKE ? ESCAPE '\\'", "scalar"),
+    # lgh_permitnumbers holds the literal 'PERMIT EXIST' on 3,260 legs since
+    # 2025 (mostly OD, LOCAL, DRA) and '' or NULL otherwise - it is a flag,
+    # not a list of numbers. lgh_permit_status is only ever UNK, and the
+    # Permits module tables are empty, so this is the only permit signal.
+    "permit_required": ("lh.lgh_permitnumbers = 'PERMIT EXIST'", "flag"),
 }
 
 # Order filters reach a leg through its stops, because a leg can carry several
@@ -835,6 +842,147 @@ _LEG_ORDER_FILTERS: dict[str, tuple[str, str]] = {
 # active_only replaces get_active_legs, which returned them all. Same reasoning
 # as _DRIVER_MAX_ROWS.
 _LEG_MAX_ROWS = 1000
+
+
+# --- Equipment: trucks and trailers -------------------------------------------
+#
+# Coordinates everywhere in TMW are SECONDS of arc, with longitude stored
+# positive for WEST: tractorprofile.trc_gps_latitude / trc_gps_longitude (int),
+# city.cty_latitude / cty_longitude and company.cmp_latseconds /
+# cmp_longseconds (decimal). Degrees = seconds / 3600; western longitude is
+# then negated. 98% of cities and 92% of companies carry coordinates.
+#
+# "Active" cannot be read from the retire date alone. 200 tractors and 664
+# trailers are unretired, but only 181 tractors and 530 trailers ran a leg in
+# the last year - retirements are not kept up. So active means not retired
+# AND used within `used_within_days` (default 365, matching what
+# get_active_power did); pass 0 to drop the usage test.
+
+def _deg(seconds_expr: str, west: bool = False) -> str:
+    """SQL turning a seconds-of-arc column into decimal degrees."""
+    if west:
+        return f"(ABS(CAST({seconds_expr} AS float)) / -3600.0)"
+    return f"(CAST({seconds_expr} AS float) / 3600.0)"
+
+
+def _miles_from(origin: tuple[float, float], lat_expr: str, lon_expr: str) -> str:
+    """Haversine distance in miles from `origin` (lat, lon degrees) to the
+    given degree expressions.
+
+    The origin is written as numeric literals rather than bound: it is always
+    a float the caller produced with float() or read from city / company, so
+    no user text reaches the SQL, and the expression can then appear in both
+    SELECT and WHERE without tracking placeholder order.
+    """
+    lat0, lon0 = float(origin[0]), float(origin[1])
+    return (
+        "(3958.8 * 2 * ASIN(SQRT("
+        f"POWER(SIN(RADIANS(({lat_expr}) - ({lat0!r})) / 2), 2) + "
+        f"COS(RADIANS({lat0!r})) * COS(RADIANS({lat_expr})) * "
+        f"POWER(SIN(RADIANS(({lon_expr}) - ({lon0!r})) / 2), 2))))"
+    )
+
+
+_TRUCK_LAT = _deg("t.trc_gps_latitude")
+_TRUCK_LON = _deg("t.trc_gps_longitude", west=True)
+
+# Tractors. Verified against the legs on 200 active units:
+#   trc_status agrees with the open legs on 197 - USE has a started leg on
+#     98/100, PLN a planned leg on 33/33, AVL nothing open on 66/67. But AVL
+#     does not mean ready: 20 AVL units have not run in 90+ days, which is why
+#     the usage test above exists. current_leg and last_used are returned so a
+#     stale status is visible.
+#   trc_driver matches the last leg's driver on 152 of 158, trc_trailer1 the
+#     last leg's trailer on 132 of 133.
+#   trc_gps_* is the latest check call - it equals the newest checkcall row to
+#     the minute for all 170 units pinging in the last 30 days - so location
+#     search reads the profile, not 2.1M check calls.
+# Teams belong to DRIVERS: trc_teamleader is set on 74 units and agrees with
+# the driver's mpp_teamleader on only 50, and trc_type4 ("Dispatched By") is
+# retired. team_leader is therefore the assigned driver's.
+#
+# Deliberately not exposed: purchase cost and cost per mile, insurer, policy
+# and coverage, owner, and the free-text trc_misc1-4 notes.
+_TRUCK_FILTERS: dict[str, tuple[str, str]] = {
+    "trucks":           ("t.trc_number IN ({ph})", "list"),
+    "vins":             ("t.trc_serial IN ({ph})", "list"),
+    "plates":           ("t.trc_licnum IN ({ph})", "list"),
+    # AVL available, PLN planned, USE in use; also VAC / INSHOP shop, PRE
+    # preventive maintenance, OUT out of service. Code or name.
+    "status":           _label_filter("t.trc_status", "TrcStatus"),
+    # COMPAN Company, O/O Owner/Operator.
+    "ownership":        _label_filter("t.trc_type1", "TrcType1"),
+    "drivers":          ("t.trc_driver IN ({ph})", "list"),
+    "team_leaders":     _label_filter("m.mpp_teamleader", "TeamLeader"),
+    "fleets":           _label_filter("t.trc_fleet", "Fleet"),
+    "terminals":        _label_filter("t.trc_terminal", "Terminal"),
+    "makes":            ("t.trc_make IN ({ph})", "list"),
+    "models":           ("t.trc_model IN ({ph})", "list"),
+    "min_year":         ("t.trc_year >= ?", "scalar"),
+    "max_year":         ("t.trc_year <= ?", "scalar"),
+    "trailers":         ("t.trc_trailer1 IN ({ph})", "list"),
+    "available_after":  ("t.trc_avl_date >= ?", "date"),
+    "available_before": ("t.trc_avl_date < ?", "date"),
+    "available_companies": ("t.trc_avl_cmp_id IN ({ph})", "list"),
+    "available_cities": ("t.trc_avl_city IN ({ph})", "list"),
+    "gps_within_hours": ("t.trc_gps_date >= DATEADD(HOUR, -?, GETDATE())", "scalar"),
+}
+
+_TRUCK_FROM = """
+    FROM tractorprofile t
+    LEFT JOIN manpowerprofile m ON m.mpp_id = t.trc_driver
+"""
+
+# Trailers. No trailer reports GPS - check calls come from tractors and
+# drivers only - so a trailer's location is where TMW says it is available
+# (trl_avail_cmp_id, else trl_avail_city), i.e. where it was last dropped or
+# will next be free. Distance searches use that and say so.
+#
+# Types (labelfile): TrlType1 "Trailer Type" (FLAT Flatbed Tandem, ROLL
+# Roll-Tite, MULTI Multi Axle Flat, VAN, STEP Stepdeck, RGN, ...), TrlType2
+# "Length" (53, 48), TrlType3 "Ownership" (COMP, O/O, LEASED, RENTAL, INTER),
+# TrlType4 broad class (FR flatbed, TW temperature-controlled, OE other).
+# trl_len / trl_wdth / trl_ht mix feet and inches and are not exposed; length
+# comes from TrlType2. Costs and the trl_misc notes (including the reefer
+# unit model) are not exposed.
+_TRAILER_FILTERS: dict[str, tuple[str, str]] = {
+    "trailers":         ("tr.trl_id IN ({ph})", "list"),
+    "vins":             ("tr.trl_serial IN ({ph})", "list"),
+    "plates":           ("tr.trl_licnum IN ({ph})", "list"),
+    "status":           _label_filter("tr.trl_status", "TrlStatus"),
+    "trailer_types":    _label_filter("tr.trl_type1", "TrlType1"),
+    "lengths":          _label_filter("tr.trl_type2", "TrlType2"),
+    "ownership":        _label_filter("tr.trl_type3", "TrlType3"),
+    "classes":          _label_filter("tr.trl_type4", "TrlType4"),
+    "makes":            ("tr.trl_make IN ({ph})", "list"),
+    "models":           ("tr.trl_model IN ({ph})", "list"),
+    "min_year":         ("tr.trl_year >= ?", "scalar"),
+    "max_year":         ("tr.trl_year <= ?", "scalar"),
+    "terminals":        _label_filter("tr.trl_terminal", "Terminal"),
+    "available_after":  ("tr.trl_avail_date >= ?", "date"),
+    "available_before": ("tr.trl_avail_date < ?", "date"),
+    "available_companies": ("tr.trl_avail_cmp_id IN ({ph})", "list"),
+    "available_cities": ("tr.trl_avail_city IN ({ph})", "list"),
+    "last_commodities": ("tr.trl_last_cmd IN ({ph})", "list"),
+    "last_used_after":  ("tr.trl_last_cmd_date >= ?", "date"),
+    "last_used_before": ("tr.trl_last_cmd_date < ?", "date"),
+}
+
+# A trailer's best known position: its available-at company, else city.
+_TRAILER_LAT = (
+    f"COALESCE(NULLIF({_deg('tac.cmp_latseconds')}, 0), NULLIF({_deg('tcy.cty_latitude')}, 0))"
+)
+_TRAILER_LON = (
+    f"COALESCE(NULLIF({_deg('tac.cmp_longseconds', west=True)}, 0), "
+    f"NULLIF({_deg('tcy.cty_longitude', west=True)}, 0))"
+)
+_TRAILER_FROM = """
+    FROM trailerprofile tr
+    LEFT JOIN company tac ON tac.cmp_id = tr.trl_avail_cmp_id
+    LEFT JOIN city tcy    ON tcy.cty_code = tr.trl_avail_city
+"""
+
+_EQUIPMENT_MAX_ROWS = 1000
 
 
 # --- Invoice search -----------------------------------------------------------
@@ -1042,7 +1190,6 @@ class TmwDB:
         timeout: int = 30,
         encrypt: str | None = None,
         trust_server_certificate: str | None = None,
-        checkcall_lookback_days: int = 30,
         max_search_rows: int = 200,
     ):
         self.server = server
@@ -1053,7 +1200,6 @@ class TmwDB:
         self.timeout = timeout
         self.encrypt = encrypt
         self.trust_server_certificate = trust_server_certificate
-        self.checkcall_lookback_days = checkcall_lookback_days
         self.max_search_rows = max_search_rows
         self._local = threading.local()
 
@@ -1069,7 +1215,6 @@ class TmwDB:
             timeout=settings.db_timeout,
             encrypt=settings.db_encrypt,
             trust_server_certificate=settings.db_trust_server_certificate,
-            checkcall_lookback_days=settings.checkcall_lookback_days,
             max_search_rows=settings.max_search_rows,
         )
 
@@ -1169,41 +1314,6 @@ class TmwDB:
     def _fetch_all_objects(self, cursor, cls):
         return [cls(*row) for row in cursor.fetchall()]
 
-    def get_truck_location(self, truck_ids: list[str]) -> list[dict]:
-        if not truck_ids:
-            return []
-
-        if not self.conn:
-            self.connect()
-
-        placeholders = ", ".join("?" * len(truck_ids))
-        cursor = self.conn.cursor()
-        cursor.execute(f"""
-            WITH ranked AS (
-                SELECT
-                    c.ckc_tractor,
-                    ROUND(c.ckc_latseconds / 3600.0, 6) AS Lat,
-                    ROUND(ABS(c.ckc_longseconds) / -3600.0, 6) AS Lon,
-                    c.ckc_date,
-                    c.ckc_comment,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY c.ckc_tractor
-                        ORDER BY c.ckc_date DESC
-                    ) AS rn
-                FROM checkcall c
-                WHERE c.ckc_tractor IN ({placeholders})
-                  AND c.ckc_date >= DATEADD(DAY, ?, GETDATE())
-            )
-            SELECT ckc_tractor, Lat, Lon, ckc_date, ckc_comment
-            FROM ranked
-            WHERE rn = 1
-        """, [*truck_ids, -self.checkcall_lookback_days])
-
-        return [
-            {"truck": row[0], "lat": row[1], "lon": row[2], "date": str(row[3]), "comment": row[4]}
-            for row in cursor.fetchall()
-        ]
-
     def search_legs(self, limit: int | None = None, **filters) -> dict:
         """Search legs, with loaded / empty / bobtail miles summed from their stops.
 
@@ -1227,6 +1337,8 @@ class TmwDB:
             valid = ", ".join(sorted({**_LEG_FILTERS, **_LEG_ORDER_FILTERS}))
             raise ValueError(f"Unknown filter {sorted(unknown)[0]!r}. Valid filters: {valid}")
 
+        if filters.get("comment_contains"):
+            filters["comment_contains"] = _like_term(str(filters["comment_contains"]).strip())
         leg_f = supplied({k: v for k, v in filters.items() if k in _LEG_FILTERS})
         order_f = supplied({k: v for k, v in filters.items() if k in _LEG_ORDER_FILTERS})
 
@@ -1292,7 +1404,9 @@ class TmwDB:
                     FROM (SELECT DISTINCT os.ord_hdrnumber FROM stops os
                           WHERE os.lgh_number = lh.lgh_number
                             AND os.ord_hdrnumber <> 0) o
-                )
+                ),
+                lh.lgh_comment,
+                lh.lgh_permitnumbers
             FROM picked
             JOIN legheader lh ON lh.lgh_number = picked.lgh_number
             OUTER APPLY ({_LEG_MILES}) m
@@ -1365,6 +1479,8 @@ class TmwDB:
             "trip_type_name": row[18],
             "stop_count": row[20] or 0,
             "orders": [int(o) for o in row[25].split(",")] if row[25] else [],
+            "comment": text(row[26]),
+            "permit_required": (row[27] or "").strip() == "PERMIT EXIST",
         }
         out.update(self._miles_breakdown(row[21], row[22], row[23], row[24], {}))
         # legheader's own figure, for comparison. The stop sum above is the
@@ -1661,36 +1777,6 @@ class TmwDB:
             "invoice_item": text(row[29]),
             "invoice_description": text(row[30]),
         }
-
-    def get_active_power(self) -> list[dict]:
-        if not self.conn:
-            self.connect()
-
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            WITH RankedLegs AS (
-                SELECT
-                    lh.lgh_tractor,
-                    mpp.mpp_teamleader,
-                    mpp.mpp_id,
-                    ROW_NUMBER() OVER (PARTITION BY lh.lgh_tractor ORDER BY lh.lgh_enddate DESC) AS rn
-                FROM legheader lh
-                LEFT JOIN manpowerprofile mpp ON mpp.mpp_id = lh.lgh_driver1
-                LEFT JOIN tractorprofile tp ON tp.trc_number = lh.lgh_tractor
-                WHERE lh.lgh_enddate > DATEADD(YEAR, -1, GETDATE())
-                    AND lh.lgh_tractor <> 'UNKNOWN'
-                    AND tp.trc_retiredate > GETDATE()
-                    AND mpp.mpp_terminationdt > GETDATE()
-            )
-            SELECT lgh_tractor, mpp_teamleader, mpp_id
-            FROM RankedLegs
-            WHERE rn = 1
-        """)
-
-        return [
-            {"tractor": row[0], "team_leader": row[1], "driver_id": row[2]}
-            for row in cursor.fetchall()
-        ]
 
     def get_truck_plan(self, truck_ids: list[str]) -> list[dict]:
         if not truck_ids:
@@ -2578,6 +2664,385 @@ class TmwDB:
             "truncated": len(rows) > limit,
             "billing_state": billing_state,
             "totals_by_currency": totals,
+        }
+
+    def _resolve_origin(self, cursor, near_latitude=None, near_longitude=None,
+                        near_city=None, near_company=None):
+        """Turn one of the "near" arguments into (lat, lon, description).
+
+        Returns None when none was given. Raises when the place is unknown or
+        carries no coordinates, rather than silently searching nowhere.
+        """
+        given = [near_latitude is not None or near_longitude is not None,
+                 near_city is not None, near_company is not None]
+        if sum(given) == 0:
+            return None
+        if sum(given) > 1:
+            raise ValueError("Give one of near_latitude/near_longitude, near_city or near_company")
+        if given[0]:
+            if near_latitude is None or near_longitude is None:
+                raise ValueError("near_latitude and near_longitude must be given together")
+            lat, lon = float(near_latitude), float(near_longitude)
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                raise ValueError("near_latitude / near_longitude are out of range")
+            return lat, lon, f"{lat:.4f},{lon:.4f}"
+        if given[1]:
+            cursor.execute(
+                "SELECT cty_latitude, cty_longitude, cty_nmstct FROM city WHERE cty_code = ?",
+                int(near_city))
+            row = cursor.fetchone()
+            what = f"city {near_city}"
+        else:
+            cursor.execute(
+                "SELECT cmp_latseconds, cmp_longseconds, cmp_name FROM company WHERE cmp_id = ?",
+                str(near_company).strip())
+            row = cursor.fetchone()
+            what = f"company {near_company}"
+        if row is None:
+            raise ValueError(f"Unknown {what}")
+        if not row[0] or not row[1]:
+            raise ValueError(f"{what} has no coordinates on file")
+        return float(row[0]) / 3600.0, -abs(float(row[1])) / 3600.0, (row[2] or "").strip()
+
+    def _equipment_where(self, filters: dict, table: dict) -> tuple[list, list]:
+        """Clauses and params for the supplied filters; none is required."""
+        if any(v is not None and v is not False for v in filters.values()):
+            where, params = _build_where(filters, table)
+            return [where], list(params)
+        return [], []
+
+    def search_trucks(
+        self,
+        include_retired: bool = False,
+        used_within_days: int | None = 365,
+        near_latitude: float | None = None,
+        near_longitude: float | None = None,
+        near_city: int | None = None,
+        near_company: str | None = None,
+        radius_miles: float | None = None,
+        limit: int | None = None,
+        **filters,
+    ) -> dict:
+        """Search tractors: profile, status, driver, team, position, plan.
+
+        No filter is required - the fleet is a few hundred units. Active means
+        not retired and used on a leg within used_within_days (0 = skip that
+        test). A "near" argument filters by GPS distance and sorts nearest
+        first; radius_miles defaults to 50.
+        """
+        if not self.conn:
+            self.connect()
+        cursor = self.conn.cursor()
+
+        clauses, params = self._equipment_where(filters, _TRUCK_FILTERS)
+        if not include_retired:
+            clauses.append("t.trc_retiredate > GETDATE()")
+        if used_within_days:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM legheader u WHERE u.lgh_tractor = t.trc_number"
+                " AND u.lgh_outstatus <> 'CAN'"
+                " AND u.lgh_enddate >= DATEADD(DAY, -?, GETDATE()))")
+            params.append(int(used_within_days))
+
+        origin = self._resolve_origin(cursor, near_latitude, near_longitude, near_city, near_company)
+        if origin:
+            radius = float(radius_miles if radius_miles is not None else 50)
+            distance = _miles_from(origin[:2], _TRUCK_LAT, _TRUCK_LON)
+            clauses.append("t.trc_gps_latitude IS NOT NULL AND t.trc_gps_latitude <> 0")
+            clauses.append(f"{distance} <= {radius!r}")
+            order = f"{distance}, t.trc_number"
+        else:
+            distance = "NULL"
+            order = "t.trc_number"
+        where = " AND ".join(clauses) if clauses else "1 = 1"
+        limit = min(limit or self.max_search_rows, _EQUIPMENT_MAX_ROWS)
+
+        cursor.execute(f"""
+            SELECT TOP (?)
+                t.trc_number, t.trc_status, st.name,
+                t.trc_type1, own.name,
+                t.trc_driver, m.mpp_lastfirst, m.mpp_status,
+                m.mpp_teamleader, tl.name,
+                t.trc_trailer1,
+                t.trc_fleet, fl.name, t.trc_terminal, tm.name,
+                t.trc_make, t.trc_model, t.trc_year, t.trc_serial,
+                t.trc_licnum, t.trc_licstate, t.trc_axles, t.trc_grosswgt, t.trc_tank_capacity,
+                t.trc_gps_odometer,
+                {_TRUCK_LAT}, {_TRUCK_LON}, t.trc_gps_desc, t.trc_gps_date,
+                {distance},
+                t.trc_avl_date, t.trc_avl_cmp_id, avc.cmp_name, avy.cty_nmstct,
+                t.trc_pln_date, t.trc_pln_lgh,
+                t.trc_prior_event, t.trc_prior_cmp_id, t.trc_prior_state,
+                t.trc_next_event, t.trc_next_cmp_id, t.trc_next_state,
+                cur.lgh_number, cur.lgh_outstatus,
+                lu.last_used,
+                t.trc_startdate, t.trc_retiredate
+            {_TRUCK_FROM}
+            LEFT JOIN labelfile st  ON st.abbr = t.trc_status AND st.labeldefinition = 'TrcStatus'
+            LEFT JOIN labelfile own ON own.abbr = t.trc_type1 AND own.labeldefinition = 'TrcType1'
+            LEFT JOIN labelfile tl  ON tl.abbr = m.mpp_teamleader AND tl.labeldefinition = 'TeamLeader'
+            LEFT JOIN labelfile fl  ON fl.abbr = t.trc_fleet AND fl.labeldefinition = 'Fleet'
+            LEFT JOIN labelfile tm  ON tm.abbr = t.trc_terminal AND tm.labeldefinition = 'Terminal'
+            LEFT JOIN company avc   ON avc.cmp_id = t.trc_avl_cmp_id
+            LEFT JOIN city avy      ON avy.cty_code = t.trc_avl_city
+            OUTER APPLY (
+                SELECT TOP 1 ol.lgh_number, ol.lgh_outstatus FROM legheader ol
+                WHERE ol.lgh_tractor = t.trc_number AND ol.lgh_outstatus IN ('STD', 'DSP', 'PLN')
+                ORDER BY CASE ol.lgh_outstatus WHEN 'STD' THEN 0 WHEN 'DSP' THEN 1 ELSE 2 END,
+                         ol.lgh_startdate, ol.lgh_number
+            ) cur
+            OUTER APPLY (
+                SELECT MAX(ul.lgh_enddate) AS last_used FROM legheader ul
+                WHERE ul.lgh_tractor = t.trc_number AND ul.lgh_outstatus <> 'CAN'
+                  AND ul.lgh_startdate <= GETDATE()
+            ) lu
+            WHERE {where}
+            ORDER BY {order}
+        """, [limit + 1, *params])
+        rows = cursor.fetchall()
+
+        def text(v):
+            return v.strip() if isinstance(v, str) and v.strip() and v.strip() not in ("UNKNOWN", "UNK") else None
+
+        def when(v):
+            return str(v) if v else None
+
+        trucks = []
+        for r in rows[:limit]:
+            gps_date = r[28]
+            trucks.append({
+                "truck": text(r[0]),
+                "status": text(r[1]),
+                "status_name": r[2],
+                "ownership": text(r[3]),
+                "ownership_name": r[4],
+                "driver": text(r[5]),
+                "driver_name": text(r[6]),
+                # A terminated driver still assigned to a truck is a data issue
+                # worth seeing, not hiding.
+                "driver_terminated": r[7] == "OUT" if r[5] else None,
+                "team_leader": text(r[8]),
+                "team_leader_name": r[9],
+                "trailer": text(r[10]),
+                "fleet": text(r[11]),
+                "fleet_name": r[12],
+                "terminal": text(r[13]),
+                "terminal_name": r[14],
+                "make": text(r[15]),
+                "model": text(r[16]),
+                "year": r[17] or None,
+                "vin": text(r[18]),
+                "plate": text(r[19]),
+                "plate_state": text(r[20]),
+                "axles": r[21] or None,
+                "gross_weight": r[22] or None,
+                "tank_capacity": r[23] or None,
+                "odometer": r[24] or None,
+                "latitude": round(r[25], 5) if r[25] else None,
+                "longitude": round(r[26], 5) if r[26] else None,
+                "location": text(r[27]),
+                "gps_time": when(gps_date),
+                "gps_age_hours": (round((datetime.now() - gps_date).total_seconds() / 3600, 1)
+                                  if gps_date else None),
+                "distance_miles": round(r[29], 1) if r[29] is not None else None,
+                "available_date": when(r[30]),
+                "available_company": text(r[31]),
+                "available_company_name": r[32],
+                "available_city": r[33],
+                "planned_date": when(r[34]),
+                "planned_leg": r[35] or None,
+                "prior_event": text(r[36]),
+                "prior_company": text(r[37]),
+                "prior_state": text(r[38]),
+                "next_event": text(r[39]),
+                "next_company": text(r[40]),
+                "next_state": text(r[41]) if text(r[41]) != "XX" else None,
+                # From the legs, so a stale trc_status can be spotted.
+                "current_leg": r[42],
+                "current_leg_status": r[43],
+                "last_used": when(r[44]),
+                "in_service_date": _real_date(r[45]),
+                "retire_date": _real_date(r[46]),
+            })
+        return {
+            "trucks": trucks,
+            "count": len(trucks),
+            "truncated": len(rows) > limit,
+            "near": ({"description": origin[2], "latitude": round(origin[0], 5),
+                      "longitude": round(origin[1], 5),
+                      "radius_miles": float(radius_miles if radius_miles is not None else 50)}
+                     if origin else None),
+        }
+
+    def search_trailers(
+        self,
+        include_retired: bool = False,
+        used_within_days: int | None = 365,
+        near_latitude: float | None = None,
+        near_longitude: float | None = None,
+        near_city: int | None = None,
+        near_company: str | None = None,
+        radius_miles: float | None = None,
+        limit: int | None = None,
+        **filters,
+    ) -> dict:
+        """Search trailers: types, status, availability, last known place.
+
+        Trailers have no GPS; "near" measures from where the trailer is
+        available (its available-at company, else city). Active means not
+        retired and used as primary trailer or pup within used_within_days.
+        """
+        if not self.conn:
+            self.connect()
+        cursor = self.conn.cursor()
+
+        clauses, params = self._equipment_where(filters, _TRAILER_FILTERS)
+        if not include_retired:
+            clauses.append("(tr.trl_retiredate IS NULL OR tr.trl_retiredate > GETDATE())")
+        if used_within_days:
+            # As a primary trailer: a seek on ix_lh_prtrl_outst per trailer,
+            # 36ms for the fleet. As a pup: lgh_primary_pup has NO index, and
+            # any form that lets the optimiser correlate it - IN, EXISTS, a
+            # CTE join - probed legheader once per trailer and took 27-34s.
+            # The pups used in the window are a handful, so they are fetched
+            # first with one range seek on the start date and inlined as a
+            # list.
+            days = int(used_within_days)
+            cursor.execute(
+                "SELECT DISTINCT LTRIM(RTRIM(lgh_primary_pup)) FROM legheader"
+                " WHERE lgh_startdate >= DATEADD(DAY, -?, GETDATE()) AND lgh_outstatus <> 'CAN'"
+                " AND NULLIF(NULLIF(LTRIM(RTRIM(lgh_primary_pup)), ''), 'UNKNOWN') IS NOT NULL",
+                days)
+            pups = [r[0] for r in cursor.fetchall()]
+            used = ("EXISTS (SELECT 1 FROM legheader u WHERE u.lgh_primary_trailer = tr.trl_id"
+                    " AND u.lgh_outstatus <> 'CAN' AND u.lgh_startdate >= DATEADD(DAY, -?, GETDATE()))")
+            params.append(days)
+            if pups:
+                used = f"({used} OR tr.trl_id IN ({', '.join('?' * len(pups))}))"
+                params.extend(pups)
+            clauses.append(used)
+
+        origin = self._resolve_origin(cursor, near_latitude, near_longitude, near_city, near_company)
+        if origin:
+            radius = float(radius_miles if radius_miles is not None else 50)
+            distance = _miles_from(origin[:2], _TRAILER_LAT, _TRAILER_LON)
+            clauses.append(f"{_TRAILER_LAT} IS NOT NULL")
+            clauses.append(f"{distance} <= {radius!r}")
+            order = f"{distance}, tr.trl_id"
+        else:
+            distance = "NULL"
+            order = "tr.trl_id"
+        where = " AND ".join(clauses) if clauses else "1 = 1"
+        limit = min(limit or self.max_search_rows, _EQUIPMENT_MAX_ROWS)
+
+        cursor.execute(f"""
+            SELECT TOP (?)
+                tr.trl_id, tr.trl_status, st.name,
+                tr.trl_type1, t1.name, tr.trl_type2, tr.trl_type3, t3.name, tr.trl_type4, t4.name,
+                tr.trl_make, tr.trl_model, tr.trl_year, tr.trl_serial, tr.trl_licnum, tr.trl_licstate,
+                tr.trl_axles, tr.trl_mtwgt, tr.trl_tareweight, tr.trl_tareweight_uom, tr.trl_grosswgt,
+                tr.trl_terminal, tm.name,
+                tr.trl_avail_date, tr.trl_avail_cmp_id, tac.cmp_name, tcy.cty_nmstct,
+                {distance},
+                tr.trl_sch_status, tr.trl_sch_date, tr.trl_sch_cmp_id,
+                tr.trl_prior_event, tr.trl_prior_cmp_id, tr.trl_prior_state,
+                tr.trl_next_event, tr.trl_next_cmp_id,
+                tr.trl_last_cmd, cm.cmd_name, tr.trl_last_cmd_ord, tr.trl_last_cmd_date,
+                cur.lgh_number, cur.lgh_outstatus, cur.lgh_tractor,
+                lu.last_used,
+                tr.trl_startdate, tr.trl_retiredate
+            {_TRAILER_FROM}
+            LEFT JOIN labelfile st ON st.abbr = tr.trl_status AND st.labeldefinition = 'TrlStatus'
+            LEFT JOIN labelfile t1 ON t1.abbr = tr.trl_type1 AND t1.labeldefinition = 'TrlType1'
+            LEFT JOIN labelfile t3 ON t3.abbr = tr.trl_type3 AND t3.labeldefinition = 'TrlType3'
+            LEFT JOIN labelfile t4 ON t4.abbr = tr.trl_type4 AND t4.labeldefinition = 'TrlType4'
+            LEFT JOIN labelfile tm ON tm.abbr = tr.trl_terminal AND tm.labeldefinition = 'Terminal'
+            LEFT JOIN commodity cm ON cm.cmd_code = tr.trl_last_cmd
+            OUTER APPLY (
+                SELECT TOP 1 ol.lgh_number, ol.lgh_outstatus, ol.lgh_tractor FROM legheader ol
+                WHERE ol.lgh_primary_trailer = tr.trl_id AND ol.lgh_outstatus IN ('STD', 'DSP', 'PLN')
+                ORDER BY CASE ol.lgh_outstatus WHEN 'STD' THEN 0 WHEN 'DSP' THEN 1 ELSE 2 END,
+                         ol.lgh_startdate, ol.lgh_number
+            ) cur
+            -- Latest leg START: covered by ix_lh_prtrl_outst (primary_trailer,
+            -- outstatus, startdate). MAX(lgh_enddate) needed a key lookup per
+            -- leg and took 2.6s for the fleet.
+            OUTER APPLY (
+                SELECT MAX(ul.lgh_startdate) AS last_used FROM legheader ul
+                WHERE ul.lgh_primary_trailer = tr.trl_id AND ul.lgh_outstatus <> 'CAN'
+                  AND ul.lgh_startdate <= GETDATE()
+            ) lu
+            WHERE {where}
+            ORDER BY {order}
+        """, [limit + 1, *params])
+        rows = cursor.fetchall()
+
+        def text(v):
+            return v.strip() if isinstance(v, str) and v.strip() and v.strip() not in ("UNKNOWN", "UNK") else None
+
+        def when(v):
+            return str(v) if v else None
+
+        trailers = []
+        for r in rows[:limit]:
+            trailers.append({
+                "trailer": text(r[0]),
+                "status": text(r[1]),
+                "status_name": r[2],
+                "trailer_type": text(r[3]),
+                "trailer_type_name": r[4],
+                "length_ft": int(r[5]) if text(r[5]) and text(r[5]).isdigit() else None,
+                "ownership": text(r[6]),
+                "ownership_name": r[7],
+                "class": text(r[8]),
+                "class_name": r[9],
+                "make": text(r[10]),
+                "model": text(r[11]) if text(r[11]) != "XXXXX" else None,
+                "year": r[12] or None,
+                "vin": text(r[13]),
+                "plate": text(r[14]),
+                "plate_state": text(r[15]),
+                "axles": r[16] or None,
+                "empty_weight": r[17] or None,
+                "tare_weight": r[18] or None,
+                "tare_weight_unit": text(r[19]),
+                "gross_weight": r[20] or None,
+                "terminal": text(r[21]),
+                "terminal_name": r[22],
+                # Last known place: where the trailer is or will be free.
+                "available_date": when(r[23]),
+                "available_company": text(r[24]),
+                "available_company_name": r[25],
+                "available_city": r[26],
+                "distance_miles": round(r[27], 1) if r[27] is not None else None,
+                "scheduled_status": text(r[28]),
+                "scheduled_date": when(r[29]),
+                "scheduled_company": text(r[30]),
+                "prior_event": text(r[31]),
+                "prior_company": text(r[32]),
+                "prior_state": text(r[33]),
+                "next_event": text(r[34]),
+                "next_company": text(r[35]),
+                "last_commodity": text(r[36]),
+                "last_commodity_name": r[37],
+                "last_order": r[38] or None,
+                "last_load_date": when(r[39]),
+                "current_leg": r[40],
+                "current_leg_status": r[41],
+                "current_truck": text(r[42]),
+                "last_used": when(r[43]),
+                "in_service_date": _real_date(r[44]),
+                "retire_date": _real_date(r[45]),
+            })
+        return {
+            "trailers": trailers,
+            "count": len(trailers),
+            "truncated": len(rows) > limit,
+            "near": ({"description": origin[2], "latitude": round(origin[0], 5),
+                      "longitude": round(origin[1], 5),
+                      "radius_miles": float(radius_miles if radius_miles is not None else 50),
+                      "measured_from": "available-at location (trailers have no GPS)"}
+                     if origin else None),
         }
 
     def _freight_row_to_dict(self, row) -> dict:

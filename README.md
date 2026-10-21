@@ -244,7 +244,6 @@ present. `.env` is gitignored; `.env.example` documents every setting.
 | `TMW_DB_TIMEOUT` | no | `30` | Connection (login) timeout, seconds |
 | `TMW_DB_ENCRYPT` | no | — | `Encrypt=` value; needed for ODBC Driver 18 |
 | `TMW_DB_TRUST_SERVER_CERTIFICATE` | no | — | `TrustServerCertificate=`; set `yes` in Docker |
-| `TMW_CHECKCALL_LOOKBACK_DAYS` | no | `30` | How far back `truck_location` searches |
 | `TMW_MAX_SEARCH_ROWS` | no | `200` | Hard cap on `search_orders` / `summarize_orders` rows |
 | `TMW_MCP_HOST` | no | `127.0.0.1` | Bind address for `--transport http` |
 | `TMW_MCP_PORT` | no | `8000` | Bind port for `--transport http` |
@@ -292,10 +291,10 @@ compose.yml.example     Container config template (copy to compose.yml)
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `truck_location` | `trucks: list[str]` | Latest GPS check call per truck |
 | `truck_plan` | `trucks: list[str]` | Active (PLN/STD) stop sequences per truck |
-| `get_active_power` | _(none)_ | Active tractors with current driver and team leader |
-| `search_legs` | many optional filters | Legs with total, loaded, empty and bobtail miles summed from their stops |
+| `search_trucks` | many optional filters, `near_*` | Trucks: status, driver, team, GPS position and nearest-to search |
+| `search_trailers` | many optional filters, `near_*` | Trailers: type, length, status, availability, last known place |
+| `search_legs` | many optional filters | Legs with total, loaded, empty and bobtail miles summed from their stops, plus dispatch comment and permit flag |
 | `search_stops` | `scope` + many optional filters | Stops by identity, status, date, appointment, location, driver, truck |
 | `search_drivers` | `name` + many optional filters | Drivers by code, name, status, assignment, licence |
 | `search_orders` | many optional filters | Orders with billed revenue, tax and invoice chain |
@@ -408,6 +407,28 @@ covers every matching leg, so aggregates stay correct when the row list is
 truncated.
 
 Completed legs are `CMP`, not `DNE` — `DNE` is a stop status.
+
+Each leg also returns its dispatch `comment`, searchable with
+`comment_contains`, and `permit_required`, which flags legs needing a permit.
+
+### Trucks and trailers
+
+`search_trucks` and `search_trailers` replace `truck_location` and
+`get_active_power`, and need no filter. "Active" means not retired **and** used
+on a leg in the last year (`used_within_days`). Retirements aren't kept up in
+TMW, so this keeps parked and sold units out.
+
+- **Trucks** carry their latest GPS position, so you can search near a
+  latitude/longitude, a city or a customer, sorted nearest first with
+  distances. They also carry status, ownership, the assigned driver and that
+  driver's team, the hooked trailer, make, model and year, and what's planned
+  next. `current_leg` and `last_used` come from the legs, so a stale status is
+  easy to spot.
+- **Trailers** don't report GPS. A trailer's location is where TMW has it
+  available, usually where it was last dropped, and "near" searches measure
+  from there. Filter by type (Flatbed, Roll-Tite, Van, ...), length (53/48),
+  temperature control, ownership, availability, or the last commodity it
+  carried.
 
 ### Freight
 

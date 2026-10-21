@@ -83,8 +83,9 @@ tools are built around those traps.
 | Any reference number (B/L, PO, PAPS, seal, load #) | `search_reference_numbers` |
 | Freight - commodity, weight, temperature, dimensions | `search_freight`, `get_order_freight`, `summarize_order_freight` |
 | Drivers | `search_drivers` |
-| Truck GPS position / upcoming plan | `truck_location`, `truck_plan` |
-| Active trucks with driver and team leader | `get_active_power` |
+| Trucks - where they are, nearest to a place, driver, team, status, specs | `search_trucks` |
+| Trailers - type, length, availability, where they sit, last load | `search_trailers` |
+| A truck's upcoming stops | `truck_plan` |
 | City name -> code | `find_city_codes` |
 | Booking agents / booking companies | `list_booking_agents`, `list_booking_companies` |
 
@@ -191,6 +192,11 @@ disagrees on about 12% of legs; report `miles`.
   `active_only` for current drivers. Driver personal data (SSN, birth date, licence number, home
   address) is not available through any tool.
 - `drivers` filters match either seat of a team.
+- Equipment: an "active" truck or trailer is one not retired AND used on a leg in the last year -
+  retirements are not kept up, so many idle units are never retired. Trucks report GPS; trailers do
+  NOT, so a trailer's location is where it was last made available (usually last dropped).
+  Dispatch teams belong to drivers: a truck's team is its assigned driver's.
+- Leg `comment` holds the dispatcher's note; `permit_required` flags legs needing a permit.
 
 ## Freight
 
@@ -207,12 +213,6 @@ The same number on an order, its stop and its invoice line is a copy, not a sepa
 """)
 settings = load_settings()
 db = TmwDB.from_settings(settings)
-
-
-@mcp.tool()
-def truck_location(trucks: list[str]) -> list[dict]:
-    """Get the latest reported location for one or more trucks by their IDs."""
-    return db.get_truck_location(trucks)
 
 
 @mcp.tool()
@@ -237,6 +237,8 @@ def search_legs(
     end_cities: list[int] | None = None,
     start_states: list[str] | None = None,
     end_states: list[str] | None = None,
+    comment_contains: str | None = None,
+    permit_required: bool = False,
     orders: list[int] | None = None,
     order_numbers: list[str] | None = None,
     billto: list[str] | None = None,
@@ -281,6 +283,13 @@ def search_legs(
     WHERE. start_/end_companies are cmp_id facility codes, start_/end_cities
     numeric codes from find_city_codes, start_/end_states two-letter codes.
 
+    NOTES AND PERMITS. Each leg carries `comment`, the dispatcher's free-text
+    note (on about 8% of legs: border/ACE notes, hook-and-split counts, pay
+    instructions). comment_contains searches it, case-insensitively.
+    permit_required is true when the leg is flagged as needing a permit -
+    mostly oversize (OD, DRA) and some local moves; permit_required=True
+    filters to those. Permit numbers, costs and dates are not recorded.
+
     ORDERS. orders, order_numbers, billto, shipper, consignee and
     booking_agent match legs that carry a stop of a matching order. A leg can
     carry several orders and an order can span several legs, so each row lists
@@ -313,6 +322,8 @@ def search_legs(
         end_cities=end_cities,
         start_states=start_states,
         end_states=end_states,
+        comment_contains=comment_contains,
+        permit_required=permit_required,
         orders=orders,
         order_numbers=order_numbers,
         billto=billto,
@@ -706,11 +717,200 @@ def search_reference_numbers(
 
 
 @mcp.tool()
-def get_active_power() -> list[dict]:
-    """Get all active trucks with their current driver and dispatch team leader.
-    Only includes non-retired tractors with active (non-terminated) drivers.
+def search_trucks(
+    trucks: list[str] | None = None,
+    status: list[str] | None = None,
+    ownership: list[str] | None = None,
+    drivers: list[str] | None = None,
+    team_leaders: list[str] | None = None,
+    fleets: list[str] | None = None,
+    terminals: list[str] | None = None,
+    trailers: list[str] | None = None,
+    makes: list[str] | None = None,
+    models: list[str] | None = None,
+    min_year: int | None = None,
+    max_year: int | None = None,
+    vins: list[str] | None = None,
+    plates: list[str] | None = None,
+    available_after: str | None = None,
+    available_before: str | None = None,
+    available_companies: list[str] | None = None,
+    available_cities: list[int] | None = None,
+    near_latitude: float | None = None,
+    near_longitude: float | None = None,
+    near_city: int | None = None,
+    near_company: str | None = None,
+    radius_miles: float | None = None,
+    gps_within_hours: float | None = None,
+    used_within_days: int = 365,
+    include_retired: bool = False,
+    limit: int = 200,
+) -> dict:
+    """Find trucks (tractors): where they are, who drives them, what's next.
+
+    No filter is required - with none, this lists the active fleet. ACTIVE
+    means not retired and used on a leg within used_within_days (default 365);
+    retirement dates are not kept up, so the usage test is what separates the
+    fleet from parked or sold units. used_within_days=30 gives the trucks
+    actually running; 0 removes the test.
+
+    LOCATION. Each truck carries its latest GPS position (latitude, longitude,
+    a description like "2 miles NE of STONEY CREEK, ON"), gps_time and
+    gps_age_hours. To find trucks near somewhere, give ONE of near_latitude +
+    near_longitude, near_city (a code from find_city_codes) or near_company (a
+    cmp_id), with radius_miles (default 50). Results then come back nearest
+    first with distance_miles (straight-line, not road miles). Add
+    gps_within_hours to ignore stale positions.
+
+    STATUS: USE in use, PLN planned, AVL available; also VAC / INSHOP in the
+    shop, PRE preventive maintenance, OUT out of service. Codes or names work
+    ("In Use"). Status agrees with the legs for nearly every truck, but AVL is
+    not proof a truck is ready - check last_used. current_leg and
+    current_leg_status come from the legs themselves (STD started, DSP
+    dispatched, PLN planned).
+
+    ownership: COMPAN Company or O/O Owner/Operator. driver is the assigned
+    driver, with driver_name; team_leader is the DRIVER's dispatch team (teams
+    belong to drivers, not trucks). team_leaders, fleets and terminals accept
+    codes or names. trailers filters on the hooked trailer.
+
+    Each truck also carries make, model, year, VIN, plate, axles, gross
+    weight, tank capacity, odometer, its available date and place, the planned
+    leg, the previous and next stop event, last_used and in-service date.
+
+    Returns {"trucks": [...], "count": n, "truncated": bool, "near": {...} or
+    null}. Use truck_plan for a truck's upcoming stops and search_legs for its
+    miles and history.
     """
-    return db.get_active_power()
+    return db.search_trucks(
+        include_retired=include_retired,
+        used_within_days=used_within_days,
+        near_latitude=near_latitude,
+        near_longitude=near_longitude,
+        near_city=near_city,
+        near_company=near_company,
+        radius_miles=radius_miles,
+        limit=limit,
+        trucks=trucks,
+        status=status,
+        ownership=ownership,
+        drivers=drivers,
+        team_leaders=team_leaders,
+        fleets=fleets,
+        terminals=terminals,
+        trailers=trailers,
+        makes=makes,
+        models=models,
+        min_year=min_year,
+        max_year=max_year,
+        vins=vins,
+        plates=plates,
+        available_after=available_after,
+        available_before=available_before,
+        available_companies=available_companies,
+        available_cities=available_cities,
+        gps_within_hours=gps_within_hours,
+    )
+
+
+@mcp.tool()
+def search_trailers(
+    trailers: list[str] | None = None,
+    status: list[str] | None = None,
+    trailer_types: list[str] | None = None,
+    lengths: list[str] | None = None,
+    classes: list[str] | None = None,
+    ownership: list[str] | None = None,
+    terminals: list[str] | None = None,
+    makes: list[str] | None = None,
+    models: list[str] | None = None,
+    min_year: int | None = None,
+    max_year: int | None = None,
+    vins: list[str] | None = None,
+    plates: list[str] | None = None,
+    available_after: str | None = None,
+    available_before: str | None = None,
+    available_companies: list[str] | None = None,
+    available_cities: list[int] | None = None,
+    last_commodities: list[str] | None = None,
+    last_used_after: str | None = None,
+    last_used_before: str | None = None,
+    near_latitude: float | None = None,
+    near_longitude: float | None = None,
+    near_city: int | None = None,
+    near_company: str | None = None,
+    radius_miles: float | None = None,
+    used_within_days: int = 365,
+    include_retired: bool = False,
+    limit: int = 200,
+) -> dict:
+    """Find trailers by type, length, status, availability and location.
+
+    No filter is required. ACTIVE means not retired and used (as primary
+    trailer or pup) within used_within_days (default 365) - many unused
+    trailers were never retired in TMW, so the usage test matters. 0 removes
+    it.
+
+    TYPES - all accept codes or names:
+      trailer_types: FLAT Flatbed Tandem, ROLL Roll-Tite, MULTI Multi Axle Flat,
+        VAN, STEP Stepdeck, RGN, CURT Curtain, MLTVAN Multi Axle Van, TRMB /
+        FLTTRM Trombone, POWTL Power Tail, FLPAXL Flip Axle, MINI Mini-Deck,
+        CHAS Chassis, DOLLY.
+      lengths: "53" or "48" (feet).
+      classes: FR flatbed, TW temperature-controlled, OE other.
+      ownership: COMP Company, O/O Owner/Operator, LEASED, RENTAL, INTER.
+    status: AVL available, HAV hooked available, PLN planned, DSP dispatched,
+    STD started, USE in use, SPL / SPU spotted for loading / unloading, OBL
+    outbound loaded, VAC / INSHOP in the shop, PRE preventive maintenance, OUT
+    out of service.
+
+    LOCATION. Trailers have NO GPS. A trailer's location is where TMW says it
+    is available - its available-at company, else city - which is normally
+    where it was last dropped. near_latitude + near_longitude, near_city or
+    near_company with radius_miles (default 50) measure from that place and
+    sort nearest first with distance_miles. A trailer currently hooked and
+    moving (current_leg set) is no longer at its available place.
+
+    Each trailer carries its types, make, model, year, VIN, plate, axles and
+    weights; available date and place; scheduled status and place; previous
+    and next stop event; current_leg and current_truck if it is on a trip;
+    the last commodity hauled with its order and date; last_used; and dates.
+    last_commodities / last_used_after find trailers by what they last
+    carried - useful for wash or contamination questions.
+
+    Returns {"trailers": [...], "count": n, "truncated": bool, "near": {...}
+    or null}.
+    """
+    return db.search_trailers(
+        include_retired=include_retired,
+        used_within_days=used_within_days,
+        near_latitude=near_latitude,
+        near_longitude=near_longitude,
+        near_city=near_city,
+        near_company=near_company,
+        radius_miles=radius_miles,
+        limit=limit,
+        trailers=trailers,
+        status=status,
+        trailer_types=trailer_types,
+        lengths=lengths,
+        classes=classes,
+        ownership=ownership,
+        terminals=terminals,
+        makes=makes,
+        models=models,
+        min_year=min_year,
+        max_year=max_year,
+        vins=vins,
+        plates=plates,
+        available_after=available_after,
+        available_before=available_before,
+        available_companies=available_companies,
+        available_cities=available_cities,
+        last_commodities=last_commodities,
+        last_used_after=last_used_after,
+        last_used_before=last_used_before,
+    )
 
 
 @mcp.tool()

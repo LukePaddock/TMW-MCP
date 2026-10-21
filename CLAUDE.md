@@ -200,7 +200,6 @@ root. `.env` is gitignored; `.env.example` documents every setting.
 | `TMW_DB_TIMEOUT` | no | `30` | Connection (login) timeout, seconds |
 | `TMW_DB_ENCRYPT` | no | — | `Encrypt=` value; needed for ODBC Driver 18 |
 | `TMW_DB_TRUST_SERVER_CERTIFICATE` | no | — | `TrustServerCertificate=`; set `yes` in Docker |
-| `TMW_CHECKCALL_LOOKBACK_DAYS` | no | `30` | How far back `truck_location` searches |
 | `TMW_MAX_SEARCH_ROWS` | no | `200` | Hard cap on `search_orders` / `summarize_orders` rows |
 | `TMW_MCP_HOST` | no | `127.0.0.1` | Bind address for `--transport http` |
 | `TMW_MCP_PORT` | no | `8000` | Bind port for `--transport http` |
@@ -316,10 +315,10 @@ filters compose.
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `truck_location` | `trucks: list[str]` | Latest GPS check-call per truck (`TMW_CHECKCALL_LOOKBACK_DAYS` window) |
 | `truck_plan` | `trucks: list[str]` | Active (PLN/STD) stop sequences for trucks, sorted by truck then trip order |
-| `get_active_power` | _(none)_ | All active tractors with current driver and team leader |
-| `search_legs` | many optional filters | Legs with total / loaded / empty / bobtail miles from their stops, plus `totals`; `active_only` replaces `get_active_legs` |
+| `search_trucks` | many optional filters, `near_*` | Tractors: status, driver and team, GPS position, nearest-to search, specs, plan |
+| `search_trailers` | many optional filters, `near_*` | Trailers: types, length, status, availability, last known place, last load |
+| `search_legs` | many optional filters | Legs with total / loaded / empty / bobtail miles from their stops, plus `totals`, `comment` and `permit_required`; `active_only` replaces `get_active_legs` |
 | `search_stops` | `scope` + many optional filters | Stops by identity, status, date, appointment, location, driver, truck - see below |
 | `search_drivers` | `name` + many optional filters | Drivers by code, name, status, assignment, licence - see below |
 | `search_orders` | many optional filters | Orders with revenue from invoices — see Revenue below |
@@ -793,6 +792,92 @@ Order filters (`_LEG_ORDER_FILTERS`) reach a leg **through its stops**:
 so filtering on it would miss legs. Miles on a shared leg are the leg's, not
 one order's share. Measured: 50 to 160ms for leg filters, and 370 to 420ms with
 an order filter.
+
+### Trucks and Trailers
+
+`search_trucks` (`tractorprofile`, 422 rows) and `search_trailers`
+(`trailerprofile`, 1,061) replaced `truck_location` and `get_active_power`.
+Neither requires a filter, since the fleets are small. `_EQUIPMENT_MAX_ROWS =
+1000`.
+
+**"Active" is not the retire date.** 200 tractors and 664 trailers are
+unretired, but only 181 tractors and 530 trailers ran a leg in the last year;
+retirements are not kept up. Active therefore means *not retired and used on
+a leg within `used_within_days`*, which defaults to 365, the window
+`get_active_power` used. 168 trucks ran in the last 30 days. Pass 0 to drop
+the usage test.
+
+**Truck fields were checked against the legs** on the 200 unretired units:
+
+| Field | Agreement |
+|---|---|
+| `trc_status` vs open legs | 197 / 200: USE has a started leg on 98/100, PLN a planned leg on 33/33, AVL nothing open on 66/67 |
+| `trc_driver` vs last leg's driver | 152 / 158 |
+| `trc_trailer1` vs last leg's trailer | 132 / 133 |
+| `trc_teamleader` vs the driver's `mpp_teamleader` | **50 / 74**; set on only 74 trucks |
+
+AVL is not proof a truck is ready: 20 AVL units had not run in 90+ days. So
+each truck also returns `current_leg` / `current_leg_status` and `last_used`
+from the legs. **Teams belong to drivers**, so `team_leader` is the assigned
+driver's `mpp_teamleader`, and `trc_type4` ("Dispatched By") is retired and
+ignored. One truck (588) still has a terminated driver assigned;
+`driver_terminated` flags it rather than hiding it.
+
+**GPS.** `trc_gps_latitude` / `trc_gps_longitude` / `trc_gps_desc` /
+`trc_gps_date` hold the latest check call. They equal the newest `checkcall`
+row to the minute for all 170 units pinging in the last 30 days, so location
+search reads the profile rather than 2.1M check calls. **Trailers have no
+GPS:** check calls come from tractors (`ckc_asgntype` `TRC`) and drivers
+(`DRV`) only, and one trailer has a stale stored position. A trailer's
+location is its available-at company, else its available-at city, which is
+usually where it was last dropped. The result says so in
+`near.measured_from`.
+
+**Coordinates are seconds of arc, with longitude positive for WEST**, on
+`tractorprofile`, `city` (`cty_latitude` / `cty_longitude`, 98% populated)
+and `company` (`cmp_latseconds` / `cmp_longseconds`, 92%). `_deg` converts
+and negates. "Near" takes one of a lat/long, `near_city` or `near_company`,
+and a radius in miles (default 50). Distance is straight-line haversine,
+written by `_miles_from` with the origin as numeric literals: the origin is
+always a float from `float()` or the city/company row, so no user text
+reaches the SQL, and the expression can sit in both SELECT and WHERE. Checked
+against an independent Python haversine: identical to 0.1 mile.
+
+Decoded labels: `TrcStatus`, `TrcType1` (Ownership: `COMPAN`, `O/O`),
+`Fleet`, `Terminal`, `TeamLeader`; `TrlStatus`, `TrlType1` (Trailer Type),
+`TrlType2` (Length: 53 / 48), `TrlType3` (Ownership), `TrlType4` (`FR`
+flatbed, `TW` temperature-controlled, `OE` other). All filters on these take
+a code or a name.
+
+**Deliberately not exposed:** purchase cost, cost per mile, insurer, policy
+and coverage, owner, and the free-text `trc_misc*` / `trl_misc*` notes (sale
+history, the occasional personal remark, and the trailer reefer-unit model).
+`trl_len` / `trl_wdth` / `trl_ht` mix feet and inches, so length comes from
+`TrlType2`.
+
+**Performance trap: `lgh_primary_pup` has no index.** A trailer usage test
+written as `EXISTS ... OR lgh_primary_pup = tr.trl_id`, or as an `IN` / CTE
+`UNION` of primary and pup, let the optimiser correlate the pup branch. It
+probed `legheader` once per trailer: **27–34s**, against 36ms for the primary
+branch alone. The pups used in the window (a handful) are fetched first with
+one range seek and inlined as a list, which brings trailer searches to
+0.2–0.5s with identical counts. Likewise `last_used` for trailers is the latest
+leg *start* (covered by `ix_lh_prtrl_outst`); `MAX(lgh_enddate)` needed a key
+lookup per leg and took 2.6s.
+
+### Leg comments and permits
+
+`search_legs` returns `comment` (`lgh_comment`), the dispatcher's note on
+about 8% of 2025+ legs: border and ACE notes, hook/split counts, pay
+instructions. `comment_contains` is an escaped substring `LIKE`.
+`lgh_trc_comment` and `lgh_etacomment` are empty and not exposed.
+
+`permit_required` is `lgh_permitnumbers = 'PERMIT EXIST'`. Despite the
+column name, that literal on 3,260 legs since 2025 is a flag, not a list of
+numbers; the rest are `''` or NULL. It is mostly on `OD`, `LOCAL` and `DRA`
+trip types. `lgh_permit_status` is only ever `UNK`, and the TMW permit module
+(`Permits`, `Permit_Requirements`, ...) is empty, so permit numbers, costs and
+validity dates do not exist here.
 
 ### Reference Numbers
 
