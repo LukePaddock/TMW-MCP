@@ -51,6 +51,15 @@ Host, port and keys come from the environment. Startup **fails** if
 `TMW_MCP_HOST` is non-loopback while `TMW_MCP_API_KEYS` is empty, so the server
 cannot be exposed unauthenticated by accident.
 
+### If the database goes away
+
+The server recovers on its own; no restart is needed. A query that hits a
+dropped connection (a network blip or a SQL Server restart) reconnects and
+retries once. While the database is unreachable, tools return "The TMW
+database is unavailable … Try again shortly" instead of a generic error, and
+the log shows `database connection lost` / `cannot connect` warnings. Calls
+succeed again as soon as SQL Server is back.
+
 ## Authentication
 
 HTTP requests require `Authorization: Bearer <key>`. Keys live in

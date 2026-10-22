@@ -238,6 +238,44 @@ between threads, and the HTTP transport dispatches sync tool functions to a thre
 client serialises calls; over HTTP it would interleave cursors and return wrong rows.
 ODBC connection pooling is on by default, so the extra connects are cheap.
 
+**Connection loss recovers on its own.** Because connections are cached per
+thread for the life of the process, a connection that died in a network blip,
+a SQL Server restart or a failover used to stay cached. That thread then
+failed every call with "Communication link failure" until the server was
+restarted, while threads that hadn't connected yet worked: an intermittent
+outage that outlived the real one. Now every public query method is wrapped
+in `@_reconnecting`:
+
+- On a connection-class error (SQLSTATE `08xxx`, or pyodbc's "closed
+  connection"), it discards that thread's connection and runs the method once
+  more, which reconnects lazily. Re-running is safe because the server only
+  reads.
+- A failure to *connect* is not retried. The login timeout has already been
+  spent, and a second attempt would only double the wait.
+- Either way the caller gets `DatabaseUnavailable` ("The TMW database is
+  unavailable … Try again shortly"). Ordinary SQL errors are never retried.
+- Wrapped methods calling each other don't stack retries.
+
+This was tested by simulating each case in-process, because the read-only
+account has no `KILL` permission: a mid-session `08S01` drop, a connection
+closed underneath, the database down at connect then restored, a drop while
+the database was still down, an ordinary SQL error (one attempt, no retry),
+and two threads with only one broken.
+
+Connections use **`autocommit=True`**. pyodbc's default opens a transaction on
+the first statement, and since this server never commits, every cached
+connection sat inside one for its whole life (`@@TRANCOUNT` was 1, and is now
+0).
+
+**Errors must be `ToolError` to reach the model.** The MCP SDK treats any
+other exception as a crash and shows the model only "Error executing tool
+<name>". That hid every deliberate message here: "At least one filter is
+required", "Unknown filter", a bad date, currency or scope. `_tool_errors` in
+`tmw_mcp.py` wraps every tool and converts `ValueError` (bad arguments) and
+`DatabaseUnavailable` into `ToolError`; anything else is still a crash, logged
+with its traceback. The wrapper keeps each tool's signature, and the tool
+schemas were verified identical with and without it.
+
 ## TMW Data Model
 
 Understanding the hierarchy is essential for interpreting query results correctly.
@@ -1041,7 +1079,10 @@ filtering and ordering into it is not.
 
 ### Adding a New Tool
 
-1. Add a query method to `TmwDB` in `tmw_db.py`
-2. Add a `@mcp.tool()` function in `tmw_mcp.py` that calls it
+1. Add a query method to `TmwDB` in `tmw_db.py`, decorated with `@_reconnecting`
+   (it opens with `if not self.conn: self.connect()` like the others). Raise
+   `ValueError` for bad arguments.
+2. Add a `@mcp.tool()` function in `tmw_mcp.py`, decorated with `@_tool_errors`
+   directly beneath it, that calls the method
 3. Write a clear docstring — this is what the model reads to understand the tool
 4. If it needs a tunable value, add it to `Settings` in `config.py` and to `.env.example`

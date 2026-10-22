@@ -1,13 +1,15 @@
 import argparse
+import functools
 import ipaddress
 import logging
 import logging.handlers
 import secrets
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from config import LOOPBACK_HOSTS, load_settings
-from tmw_db import TmwDB
+from tmw_db import DatabaseUnavailable, TmwDB
 
 logger = logging.getLogger("tmw_mcp")
 
@@ -215,7 +217,28 @@ settings = load_settings()
 db = TmwDB.from_settings(settings)
 
 
+def _tool_errors(fn):
+    """Pass anticipated failures to the model as readable errors.
+
+    The SDK treats any exception other than ToolError as a crash and shows the
+    model only "Error executing tool <name>". That hid every deliberate
+    message here - "At least one filter is required", "Unknown filter", a bad
+    date or currency - and would hide "database unavailable", so the model
+    could neither fix its call nor tell an outage from a bug. ValueError is
+    what the query layer raises for bad arguments, and DatabaseUnavailable
+    for a lost database; both become ToolError. Anything else is still a crash.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except (DatabaseUnavailable, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
+    return wrapper
+
+
 @mcp.tool()
+@_tool_errors
 def search_legs(
     active_only: bool = False,
     leg_status: list[str] | None = None,
@@ -334,6 +357,7 @@ def search_legs(
 
 
 @mcp.tool()
+@_tool_errors
 def search_drivers(
     name: str | None = None,
     drivers: list[str] | None = None,
@@ -433,6 +457,7 @@ def search_drivers(
 
 
 @mcp.tool()
+@_tool_errors
 def search_stops(
     scope: str = "stop",
     orders: list[int] | None = None,
@@ -621,6 +646,7 @@ def search_stops(
 
 
 @mcp.tool()
+@_tool_errors
 def search_reference_numbers(
     reference_numbers: list[str] | None = None,
     reference_contains: str | None = None,
@@ -717,6 +743,7 @@ def search_reference_numbers(
 
 
 @mcp.tool()
+@_tool_errors
 def search_trucks(
     trucks: list[str] | None = None,
     status: list[str] | None = None,
@@ -814,6 +841,7 @@ def search_trucks(
 
 
 @mcp.tool()
+@_tool_errors
 def search_trailers(
     trailers: list[str] | None = None,
     status: list[str] | None = None,
@@ -914,12 +942,14 @@ def search_trailers(
 
 
 @mcp.tool()
+@_tool_errors
 def truck_plan(trucks: list[str]) -> list[dict]:
     """Get all active (Planned/Started) trips and their stop sequences for one or more trucks."""
     return db.get_truck_plan(trucks)
 
 
 @mcp.tool()
+@_tool_errors
 def find_city_codes(name: str, state: str | None = None) -> list[dict]:
     """Resolve a city name to the numeric city codes TMW stores on orders.
 
@@ -932,6 +962,7 @@ def find_city_codes(name: str, state: str | None = None) -> list[dict]:
 
 
 @mcp.tool()
+@_tool_errors
 def list_booking_agents(include_retired: bool = True) -> list[dict]:
     """List the booking agents — the people who book loads — with their order activity.
 
@@ -951,6 +982,7 @@ def list_booking_agents(include_retired: bool = True) -> list[dict]:
 
 
 @mcp.tool()
+@_tool_errors
 def list_booking_companies(include_retired: bool = True) -> list[dict]:
     """List the sub-companies that book loads, with their order activity.
 
@@ -967,6 +999,7 @@ def list_booking_companies(include_retired: bool = True) -> list[dict]:
 
 
 @mcp.tool()
+@_tool_errors
 def search_orders(
     started_after: str | None = None,
     started_before: str | None = None,
@@ -1066,6 +1099,7 @@ def search_orders(
 
 
 @mcp.tool()
+@_tool_errors
 def summarize_orders(
     group_by: str,
     started_after: str | None = None,
@@ -1155,6 +1189,7 @@ def summarize_orders(
 
 
 @mcp.tool()
+@_tool_errors
 def search_invoice(
     invoice_numbers: list[str] | None = None,
     orders: list[int] | None = None,
@@ -1246,6 +1281,7 @@ def search_invoice(
 
 
 @mcp.tool()
+@_tool_errors
 def search_invoice_details(
     billing_state: str = "active",
     orders: list[int] | None = None,
@@ -1347,6 +1383,7 @@ def search_invoice_details(
 
 
 @mcp.tool()
+@_tool_errors
 def get_order_freight(orders: list[str], stop_type: str = "DRP") -> list[dict]:
     """Get the freight lines (commodity, weight, count, temperature, dimensions) for orders.
 
@@ -1364,6 +1401,7 @@ def get_order_freight(orders: list[str], stop_type: str = "DRP") -> list[dict]:
 
 
 @mcp.tool()
+@_tool_errors
 def summarize_order_freight(orders: list[str]) -> list[dict]:
     """Get per-order freight totals, with the pickup figures alongside for comparison.
 
@@ -1390,6 +1428,7 @@ def summarize_order_freight(orders: list[str]) -> list[dict]:
 
 
 @mcp.tool()
+@_tool_errors
 def search_freight(
     stop_type: str = "DRP",
     weight_basis: str = "LBS",

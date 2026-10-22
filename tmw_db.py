@@ -1,8 +1,12 @@
+import functools
 import locale
+import logging
 import threading
 from datetime import datetime
 
 import pyodbc
+
+logger = logging.getLogger("tmw_mcp.db")
 
 # --- Order search ---------------------------------------------------------
 #
@@ -1179,6 +1183,75 @@ def _build_where(filters: dict, spec_table: dict | None = None) -> tuple[str, li
 
 
 
+# --- Connection loss --------------------------------------------------------
+#
+# Connections are cached per worker thread and reused for the life of the
+# process. Without this, a connection that died - a network blip, a SQL Server
+# restart, a failover - stayed cached, and that thread failed every call with
+# "Communication link failure" until the server was restarted, while threads
+# that had not connected yet worked: an intermittent outage that outlived the
+# real one.
+#
+# Every public query method is wrapped in @_reconnecting. On a connection-class
+# error it discards the thread's connection and runs the method once more,
+# which reconnects lazily. Re-running is safe because this server only reads.
+# A failure to CONNECT is not retried: the login timeout has already been
+# spent, and a second attempt would only double the wait before the same
+# error. Either way the caller gets DatabaseUnavailable, a plain message
+# rather than a driver traceback.
+
+class DatabaseUnavailable(RuntimeError):
+    """SQL Server could not be reached. Safe to retry later."""
+
+
+def _is_connection_error(exc: Exception) -> bool:
+    """True for errors meaning the connection is gone, not that the SQL failed.
+
+    SQLSTATE class 08 is ODBC's connection-exception class: 08S01
+    communication link failure (TCP reset, server restart), 08001 unable to
+    connect, 08003 connection not open. pyodbc reports a connection closed
+    underneath it as a ProgrammingError with no SQLSTATE, so that is matched
+    by message.
+    """
+    state = exc.args[0] if exc.args else ""
+    if isinstance(state, str) and state.startswith("08"):
+        return True
+    text = str(exc).lower()
+    return "closed connection" in text or "communication link failure" in text
+
+
+def _reconnecting(method):
+    """Retry a read-only query method once on a fresh connection."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        # A wrapped method calling another must not stack retries.
+        if getattr(self._local, "in_call", False):
+            return method(self, *args, **kwargs)
+        self._local.in_call = True
+        try:
+            try:
+                return method(self, *args, **kwargs)
+            except pyodbc.Error as exc:
+                if not _is_connection_error(exc):
+                    raise
+                logger.warning("database connection lost (%s); reconnecting", exc.args[0])
+                self._discard()
+            try:
+                return method(self, *args, **kwargs)
+            except pyodbc.Error as exc:
+                if not _is_connection_error(exc):
+                    raise
+                self._discard()
+                raise DatabaseUnavailable(
+                    "The TMW database is unavailable (connection lost and could not be "
+                    "re-established). Try again shortly."
+                ) from exc
+        finally:
+            self._local.in_call = False
+    wrapper._reconnecting = True
+    return wrapper
+
+
 class TmwDB:
     def __init__(
         self,
@@ -1253,7 +1326,17 @@ class TmwDB:
         if self.trust_server_certificate:
             conn_str += f"TrustServerCertificate={self.trust_server_certificate};"
 
-        self.conn = pyodbc.connect(conn_str, timeout=self.timeout)
+        # autocommit: this server only reads. pyodbc's default opens a
+        # transaction on the first statement and, with nothing ever committing,
+        # each cached connection would sit inside one for its whole life.
+        try:
+            self.conn = pyodbc.connect(conn_str, timeout=self.timeout, autocommit=True)
+        except pyodbc.Error as exc:
+            self.conn = None
+            logger.warning("cannot connect to %s/%s: %s", self.server, self.database, exc.args[0])
+            raise DatabaseUnavailable(
+                "The TMW database is unavailable (cannot connect). Try again shortly."
+            ) from exc
         # Bind str parameters as varchar, not pyodbc's default nvarchar. The
         # TMW columns are varchar under a SQL collation, where comparing one to
         # an nvarchar parameter converts the COLUMN on every row and cannot
@@ -1276,6 +1359,16 @@ class TmwDB:
         if self.conn:
             self.conn.close()
             self.conn = None
+
+    def _discard(self):
+        """Drop this thread's connection after it failed; closing a dead one
+        can raise too, and that is not news."""
+        conn, self.conn = self.conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except pyodbc.Error:
+                pass
 
     def _stop_row_to_dict(self, row) -> dict:
         return {
@@ -1314,6 +1407,7 @@ class TmwDB:
     def _fetch_all_objects(self, cursor, cls):
         return [cls(*row) for row in cursor.fetchall()]
 
+    @_reconnecting
     def search_legs(self, limit: int | None = None, **filters) -> dict:
         """Search legs, with loaded / empty / bobtail miles summed from their stops.
 
@@ -1522,6 +1616,7 @@ class TmwDB:
         s.stp_refnum
     """
 
+    @_reconnecting
     def search_stops(
         self,
         scope: str = "stop",
@@ -1630,6 +1725,7 @@ class TmwDB:
             "scope": scope,
         }
 
+    @_reconnecting
     def search_reference_numbers(self, limit: int | None = None, **filters) -> dict:
         """Search every reference filed against orders, stops, freight and invoices.
 
@@ -1778,6 +1874,7 @@ class TmwDB:
             "invoice_description": text(row[30]),
         }
 
+    @_reconnecting
     def get_truck_plan(self, truck_ids: list[str]) -> list[dict]:
         if not truck_ids:
             return []
@@ -1850,6 +1947,7 @@ class TmwDB:
             for row in cursor.fetchall()
         ]
 
+    @_reconnecting
     def resolve_cities(self, name: str, state: str | None = None, limit: int = 25) -> list[dict]:
         if not self.conn:
             self.connect()
@@ -1921,6 +2019,7 @@ class TmwDB:
             for row in cursor.fetchall()
         ]
 
+    @_reconnecting
     def list_booking_agents(self, include_retired: bool = True) -> list[dict]:
         """Booking agents (RevType4), excluding the legacy load-class codes."""
         return self._list_labels(
@@ -1928,6 +2027,7 @@ class TmwDB:
             _REVTYPE4_LEGACY_SQL, include_retired,
         )
 
+    @_reconnecting
     def list_booking_companies(self, include_retired: bool = True) -> list[dict]:
         """Booking sub-companies (RevType1)."""
         return self._list_labels(
@@ -2001,6 +2101,7 @@ class TmwDB:
             "trainee": row[28] == "Y",
         }
 
+    @_reconnecting
     def search_drivers(
         self,
         name: str | None = None,
@@ -2146,6 +2247,7 @@ class TmwDB:
                           "revenue_source": source, "tax": None}
         return out
 
+    @_reconnecting
     def search_orders(self, limit: int | None = None, **filters) -> dict:
         if not self.conn:
             self.connect()
@@ -2240,6 +2342,7 @@ class TmwDB:
             "truncated": truncated,
         }
 
+    @_reconnecting
     def summarize_orders(self, group_by: str, limit: int | None = None, **filters) -> dict:
         """Aggregate order revenue by one grouping key, split by currency.
 
@@ -2382,6 +2485,7 @@ class TmwDB:
             "truncated": truncated,
         }
 
+    @_reconnecting
     def search_invoice(
         self,
         include_cancelled: bool = False,
@@ -2529,6 +2633,7 @@ class TmwDB:
             "totals_by_currency": totals,
         }
 
+    @_reconnecting
     def search_invoice_details(
         self,
         billing_state: str = "active",
@@ -2711,6 +2816,7 @@ class TmwDB:
             return [where], list(params)
         return [], []
 
+    @_reconnecting
     def search_trucks(
         self,
         include_retired: bool = False,
@@ -2874,6 +2980,7 @@ class TmwDB:
                      if origin else None),
         }
 
+    @_reconnecting
     def search_trailers(
         self,
         include_retired: bool = False,
@@ -3122,6 +3229,7 @@ class TmwDB:
         {_temp_f('f.fgt_hitemp')}
     """
 
+    @_reconnecting
     def search_freight(
         self,
         stop_type: str | None = "DRP",
@@ -3226,6 +3334,7 @@ class TmwDB:
             "temp_basis": t_basis,
         }
 
+    @_reconnecting
     def get_order_freight(
         self, order_ids: list[str], stop_type: str | None = "DRP"
     ) -> list[dict]:
@@ -3254,6 +3363,7 @@ class TmwDB:
 
         return [self._freight_row_to_dict(r) for r in cursor.fetchall()]
 
+    @_reconnecting
     def summarize_order_freight(self, order_ids: list[str]) -> list[dict]:
         """Per-order freight totals for the PUP and DRP copies, and whether they agree.
 
